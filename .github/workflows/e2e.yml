@@ -20,7 +20,40 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Fork-only exact-head validation for PR #2875. This branch is deleted after
+  # the run; production code remains byte-identical to 567974bd.
+  email-citation-engine-parity:
+    if: github.ref == 'refs/heads/ci/validate-email-citation-567974b'
+    name: Email citation Postgres ↔ PGLite parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: gbrain_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.3.13
+      - run: bun install
+      - name: Run exact email citation engine parity regression
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
+        run: bun test test/e2e/engine-parity.test.ts
+
   jsonb-parity:
+    if: github.ref != 'refs/heads/ci/validate-email-citation-567974b'
     # Dedicated required guard for the JSONB double-encode bug-class (#2339).
     # PGLite parses a double-encoded jsonb string silently, so this assertion can
     # ONLY be made on real Postgres — a normal gated e2e file would skip without
@@ -64,6 +97,7 @@ jobs:
         run: bun test test/e2e/op-checkpoint-jsonb-parity.test.ts test/e2e/jsonb-roundtrip.test.ts
 
   tier1:
+    if: github.ref != 'refs/heads/ci/validate-email-citation-567974b'
     name: Tier 1 (Mechanical)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -93,6 +127,7 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
 
   tier2:
+    if: github.ref != 'refs/heads/ci/validate-email-citation-567974b'
     name: Tier 2 (LLM Skills)
     runs-on: ubuntu-latest
     # Runs on every push/PR now (promoted from schedule-only in v0.19.0).
