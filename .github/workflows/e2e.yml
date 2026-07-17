@@ -23,7 +23,7 @@ jobs:
   # Fork-only exact-head validation for PR #2875. This branch is deleted after
   # the run; production code remains byte-identical to 567974bd.
   email-citation-engine-parity:
-    if: github.ref == 'refs/heads/ci/validate-email-citation-567974b'
+    if: github.ref == 'refs/heads/ci/validate-email-citation-3cf4c61'
     name: Email citation Postgres ↔ PGLite parity
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -53,7 +53,7 @@ jobs:
         run: bun test test/e2e/engine-parity.test.ts
 
   jsonb-parity:
-    if: github.ref != 'refs/heads/ci/validate-email-citation-567974b'
+    if: github.ref != 'refs/heads/ci/validate-email-citation-3cf4c61'
     # Dedicated required guard for the JSONB double-encode bug-class (#2339).
     # PGLite parses a double-encoded jsonb string silently, so this assertion can
     # ONLY be made on real Postgres — a normal gated e2e file would skip without
@@ -97,7 +97,7 @@ jobs:
         run: bun test test/e2e/op-checkpoint-jsonb-parity.test.ts test/e2e/jsonb-roundtrip.test.ts
 
   tier1:
-    if: github.ref != 'refs/heads/ci/validate-email-citation-567974b'
+    if: github.ref != 'refs/heads/ci/validate-email-citation-3cf4c61'
     name: Tier 1 (Mechanical)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -127,7 +127,7 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
 
   tier2:
-    if: github.ref != 'refs/heads/ci/validate-email-citation-567974b'
+    if: github.ref != 'refs/heads/ci/validate-email-citation-3cf4c61'
     name: Tier 2 (LLM Skills)
     runs-on: ubuntu-latest
     # Runs on every push/PR now (promoted from schedule-only in v0.19.0).
