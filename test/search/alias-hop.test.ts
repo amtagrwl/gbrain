@@ -35,6 +35,8 @@ describe('applyAliasHop', () => {
         message_id: '<mingtang@example.com>',
         thread_id: 'thread-mingtang',
         subject: 'Mingtang project update',
+        // Internal SQL projection aliases are not trusted frontmatter fields.
+        source_subject: 'Spoofed projection alias',
       },
     });
     await engine.setPageAliases('projects/mingtang', 'default', ['hall of light', '明堂']);

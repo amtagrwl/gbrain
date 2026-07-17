@@ -2,6 +2,26 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.62.0] - 2026-07-17
+
+**Email-backed search results now carry the exact message identity needed to open the original evidence. Keyword, vector, graph, alias, and structural-search paths return the same Message-ID, thread ID, and subject when those fields are present in trusted email frontmatter. Non-email pages stay unchanged. Source grants remain enforced during structural expansion, so a search can add useful code neighbors without pulling content or citation metadata from a source the caller cannot read.**
+
+### Itemized changes
+
+#### Added
+- **Search results expose exact email provenance.** `SearchResult` can include `message_id`, `thread_id`, and `source_subject`, projected consistently by PGLite and Postgres keyword, vector, chunk, relational, alias, and two-pass paths. Subjects are emitted only when a non-blank Message-ID establishes email identity; page titles and generated summaries are never promoted into source metadata.
+
+#### Security
+- **Structural retrieval preserves scalar and federated source grants.** Near-symbol lookup, unresolved-symbol resolution, direct chunk-edge traversal, and hydration all enforce `sourceId` or `sourceIds`; destination checks fail closed if scope verification fails.
+- **Malformed frontmatter cannot become trusted citation metadata.** JSON numbers, booleans, arrays, and objects are rejected instead of being stringified by JSONB extraction. Raw frontmatter also ignores the internal `source_subject` projection alias when an allowlisted `subject` is present.
+
+#### Internal
+- Search cache contract v13 forces a one-time cold miss so cached pre-provenance rows cannot hide newly available citation fields. No schema migration is required.
+
+### To take advantage of v0.42.62.0
+
+Run `gbrain upgrade`, then restart long-running MCP and HTTP processes so they load the expanded search-result contract. Existing email pages do not need re-importing; their allowlisted frontmatter fields are projected at query time.
+
 ## [0.42.61.0] - 2026-07-16
 
 **If gbrain's background daemon dies hard, a restart now takes over right away instead of waiting minutes for a stale lock to expire. Re-processing the same content no longer piles up near-duplicate knowledge atoms. On large brains, the takes bootstrap finally works through the whole corpus instead of re-scanning the same newest pages every run. And `gbrain schema use` can now activate the schema packs gbrain actually ships — including the install default — instead of just one hardcoded name. Cost tracking also learns the newest Claude models, so spend on them is metered instead of invisible.**

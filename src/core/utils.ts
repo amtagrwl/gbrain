@@ -343,7 +343,7 @@ export function projectEmailCitationMetadata(
   if (typeof record.thread_id === 'string' && record.thread_id.length > 0) {
     metadata.thread_id = record.thread_id;
   }
-  const subject = record.source_subject ?? record.subject;
+  const subject = record.subject ?? record.source_subject;
   if (metadata.message_id && typeof subject === 'string' && subject.length > 0) {
     metadata.source_subject = subject;
   }
