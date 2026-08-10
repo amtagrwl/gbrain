@@ -1,5 +1,5 @@
-import { readFileSync, statSync, lstatSync } from 'fs';
-import { basename, extname } from 'path';
+import { readFileSync, statSync, lstatSync, realpathSync } from 'fs';
+import { basename, extname, isAbsolute, relative, resolve, sep } from 'path';
 import { createHash } from 'crypto';
 import { marked } from 'marked';
 import type { BrainEngine, FileSpec } from './engine.ts';
@@ -41,6 +41,12 @@ import { computeCorpusGeneration } from './contextual-retrieval-service.ts';
 import { DEFAULT_SYNOPSIS_MODEL } from './page-summary.ts';
 import { runGuardrails } from './guardrails.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence } from './facts-fence.ts';
+import { buildBoundedImageOcrRequestBody } from './image-ocr-provider.ts';
+import {
+  assertImageImportFenceToken,
+  withImageImportFence,
+  type ImageImportFenceToken,
+} from './image-import-fence.ts';
 
 /**
  * v0.20.0 Cathedral II Layer 8 D2 — markdown fence extraction helper.
@@ -1598,6 +1604,42 @@ async function decodeIfNeeded(ext: string, buf: Buffer): Promise<{ buf: Buffer; 
   return { buf, mime: mimeMap[ext] ?? 'application/octet-stream' };
 }
 
+/** Internal, zero-provider preparation used only by the confirmed OCR command. */
+export async function prepareBoundedImageOcrInput(
+  filePath: string,
+  imageSlug: string,
+  registeredRoot: string,
+  expectedHash: string,
+): Promise<{ buf: Buffer; mime: string }> {
+  if (lstatSync(filePath).isSymbolicLink()) throw new Error('Bounded image OCR file may not be a symlink');
+  if (!isAbsolute(registeredRoot) || resolve(registeredRoot) !== registeredRoot) {
+    throw new Error('Bounded image OCR lacks a canonical registered source root');
+  }
+  const realRelative = relative(realpathSync(registeredRoot), realpathSync(filePath));
+  if (
+    !realRelative
+    || realRelative === '..'
+    || realRelative.startsWith(`..${sep}`)
+    || isAbsolute(realRelative)
+    || realRelative.split(sep).join('/').toLowerCase() !== imageSlug
+  ) {
+    throw new Error('Bounded image OCR file is no longer inside its registered source root');
+  }
+  if (statSync(filePath).size > MAX_IMAGE_BYTES) {
+    throw new Error(`Bounded image OCR file exceeds ${MAX_IMAGE_BYTES} bytes`);
+  }
+  const buf = readFileSync(filePath);
+  if (createHash('sha256').update(buf).digest('hex') !== expectedHash) {
+    throw new Error('Bounded image OCR file hash changed after manifest validation');
+  }
+  const prepared = await decodeIfNeeded(extname(filePath).toLowerCase(), buf);
+  // Build and measure the exact UTF-8 JSON wire body during full-manifest
+  // preflight. The provider boundary rebuilds and checks it again after the
+  // final file/hash revalidation.
+  buildBoundedImageOcrRequestBody(prepared.buf, prepared.mime);
+  return prepared;
+}
+
 /** EXIF metadata stamped onto image-page frontmatter (cherry-2). */
 async function readExifSafe(buf: Buffer): Promise<Record<string, unknown>> {
   try {
@@ -1625,58 +1667,15 @@ async function readExifSafe(buf: Buffer): Promise<Record<string, unknown>> {
   }
 }
 
-/**
- * Cherry-1 OCR: optional gpt-4o-mini pass extracting visible text from an
- * image. Returns '' when:
- * - the embedding_image_ocr config flag is off (default)
- * - the configured expansion model is unavailable (no API key)
- * - the OCR call itself fails (logged once per session)
- *
- * Eng-1B: per-call result is reflected in counters the doctor `ocr_health`
- * check reads. Counter writes are best-effort; never fail the import.
- *
- * The system prompt explicitly tells the model not to follow instructions
- * embedded in the image (mitigation for the OCR-as-prompt-injection vector).
- */
-let _ocrWarnedThisSession = false;
-async function maybeOcr(
-  engine: BrainEngine,
-  imgBuf: Buffer,
-  mime: string,
+/** Routine compatibility seam: deliberately contains no paid OCR provider. */
+export async function maybeOcr(
+  _engine: BrainEngine,
+  _imgBuf: Buffer,
+  _mime: string,
 ): Promise<string> {
-  const opt = process.env.GBRAIN_EMBEDDING_IMAGE_OCR;
-  if (opt !== 'true') return '';
-
-  // Counter helpers — quiet failure if config table is unavailable.
-  async function bump(key: string) {
-    try {
-      const cur = parseInt((await engine.getConfig(key)) ?? '0', 10);
-      await engine.setConfig(key, String((Number.isFinite(cur) ? cur : 0) + 1));
-    } catch { /* non-fatal */ }
-  }
-
-  await bump('ocr_attempted');
-  try {
-    const { isAvailable, generateOcrText } = await import('./ai/gateway.ts');
-    if (!isAvailable('expansion')) {
-      if (!_ocrWarnedThisSession) {
-        console.warn('[gbrain] OCR opt-in is true but expansion model is unavailable; skipping OCR for this session');
-        _ocrWarnedThisSession = true;
-      }
-      await bump('ocr_failed_no_key');
-      return '';
-    }
-    const text = await generateOcrText(imgBuf, mime);
-    await bump('ocr_succeeded');
-    return text;
-  } catch (err) {
-    if (!_ocrWarnedThisSession) {
-      console.warn(`[gbrain] OCR call failed (continuing without OCR text): ${err instanceof Error ? err.message : String(err)}`);
-      _ocrWarnedThisSession = true;
-    }
-    await bump('ocr_failed_other');
-    return '';
-  }
+  // Routine import and sync code has no paid OCR implementation. The only
+  // provider call lives privately in the confirmed image-ocr-run command.
+  return '';
 }
 
 export interface ImportImageOptions {
@@ -1690,6 +1689,13 @@ export interface ImportImageOptions {
    * with sourceId would TS-error on the importImageFile branch.
    */
   sourceId?: string;
+  /** Override the shared cross-process fence root for hermetic tests. */
+  imageImportFenceRoot?: string;
+}
+
+interface InternalImportImageOptions extends ImportImageOptions {
+  boundedOcr?: { text: string; expectedHash: string; registeredRoot: string };
+  imageImportFenceToken: ImageImportFenceToken;
 }
 
 /** Module-level limiter so concurrent imports across files share the budget. */
@@ -1707,6 +1713,45 @@ export async function importImageFile(
   relativePath: string,
   opts: ImportImageOptions = {},
 ): Promise<ImportResult> {
+  return withImageImportFence(
+    token => importImageFileInternal(
+      engine,
+      filePath,
+      relativePath,
+      { ...opts, imageImportFenceToken: token },
+    ),
+    { lockRoot: opts.imageImportFenceRoot },
+  );
+}
+
+/** Internal zero-provider adapter for text produced by the confirmed command. */
+export async function importImageFileWithBoundedOcrText(
+  engine: BrainEngine,
+  filePath: string,
+  relativePath: string,
+  sourceId: string,
+  registeredRoot: string,
+  expectedHash: string,
+  ocrText: string,
+  imageImportFenceToken: ImageImportFenceToken,
+): Promise<ImportResult> {
+  if (ocrText.trim().length === 0) throw new Error('Bounded image OCR text is empty');
+  assertImageImportFenceToken(imageImportFenceToken);
+  return importImageFileInternal(engine, filePath, relativePath, {
+    sourceId,
+    noEmbed: true,
+    boundedOcr: { text: ocrText, expectedHash, registeredRoot },
+    imageImportFenceToken,
+  });
+}
+
+async function importImageFileInternal(
+  engine: BrainEngine,
+  filePath: string,
+  relativePath: string,
+  opts: InternalImportImageOptions,
+): Promise<ImportResult> {
+  assertImageImportFenceToken(opts.imageImportFenceToken);
   // Defense-in-depth: reject symlinks before reading bytes.
   const lstat = lstatSync(filePath);
   if (lstat.isSymbolicLink()) {
@@ -1736,9 +1781,12 @@ export async function importImageFile(
   const hash = createHash('sha256').update(buf).digest('hex');
 
   const existing = await engine.getPage(imageSlug, sourceOpts);
-  if (existing?.content_hash === hash) {
+  if (existing?.content_hash === hash && !opts.boundedOcr) {
     return { slug: imageSlug, status: 'skipped', chunks: 0 };
   }
+  // A paid result must never disappear into the routine idempotent-skip path.
+  // Under the shared import fence a same-hash row can only predate the paid
+  // attempt; upgrade it transactionally with the OCR text and no embedding.
 
   // Decode HEIC/AVIF; pass-through for universal codecs.
   let decoded: { buf: Buffer; mime: string };
@@ -1756,11 +1804,32 @@ export async function importImageFile(
   // EXIF metadata (cherry-2). Pure JS, sub-ms; no concurrency knob needed.
   const exif = await readExifSafe(buf);
 
-  // OCR opt-in (cherry-1). Runs through the per-process limiter so 100
-  // images first-import doesn't serialize into 200s of OCR latency.
-  const ocrText: string = opts.noEmbed
+  if (opts.boundedOcr) {
+    if (!isAbsolute(opts.boundedOcr.registeredRoot) || resolve(opts.boundedOcr.registeredRoot) !== opts.boundedOcr.registeredRoot) {
+      throw new Error('Bounded image OCR lacks a canonical registered source root');
+    }
+    const realRoot = realpathSync(opts.boundedOcr.registeredRoot);
+    const realFile = realpathSync(filePath);
+    const realRelative = relative(realRoot, realFile);
+    if (
+      !realRelative
+      || realRelative === '..'
+      || realRelative.startsWith(`..${sep}`)
+      || isAbsolute(realRelative)
+      || realRelative.split(sep).join('/').toLowerCase() !== imageSlug
+    ) {
+      throw new Error('Bounded image OCR file is no longer inside its registered source root');
+    }
+    if (hash !== opts.boundedOcr.expectedHash) {
+      throw new Error('Bounded image OCR file hash changed after manifest validation');
+    }
+  }
+
+  // Routine callers receive no OCR text. The confirmed bounded command may
+  // supply text that it obtained only after a durable budget reservation.
+  const ocrText: string = opts.boundedOcr?.text ?? (opts.noEmbed
     ? ''
-    : await _ocrLimiter(() => maybeOcr(engine, decoded.buf, decoded.mime));
+    : await _ocrLimiter(() => maybeOcr(engine, decoded.buf, decoded.mime)));
 
   // Multimodal embed.
   let embedding: Float32Array | null = null;

@@ -125,6 +125,64 @@ for f in "${GUARDED_FILES[@]}"; do
   fi
 done
 
+# The bounded OCR provider is the sole reviewed exception for NEW direct
+# Anthropic transport code. Existing legacy SDK users are not silently blessed:
+# this PR-diff scan rejects any added/changed direct endpoint, fetch, constructor,
+# or runtime SDK import outside the private provider module. The two full-file
+# GUARDED_FILES checks above remain permanent regardless of diff scope.
+DIRECT_ANTHROPIC_EXCEPTION="src/core/image-ocr-provider.ts"
+DIRECT_SCAN_FILES=()
+if [ -n "${GBRAIN_DIRECT_ANTHROPIC_SCAN_FILES:-}" ]; then
+  while IFS= read -r f; do
+    [ -n "$f" ] && DIRECT_SCAN_FILES+=("$f")
+  done <<< "$GBRAIN_DIRECT_ANTHROPIC_SCAN_FILES"
+else
+  BASE_REF="${GBRAIN_DIRECT_ANTHROPIC_BASE_REF:-origin/master}"
+  if git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
+    while IFS= read -r f; do
+      [ -n "$f" ] && DIRECT_SCAN_FILES+=("$f")
+    done < <(git diff --name-only --diff-filter=ACMR "$BASE_REF" -- 'src/**/*.ts' 'src/*.ts')
+  fi
+  while IFS= read -r f; do
+    [ -n "$f" ] && DIRECT_SCAN_FILES+=("$f")
+  done < <(git ls-files --others --exclude-standard -- 'src/**/*.ts' 'src/*.ts')
+fi
+
+for f in "${DIRECT_SCAN_FILES[@]}"; do
+  [ "$f" = "$DIRECT_ANTHROPIC_EXCEPTION" ] && continue
+  [ -f "$f" ] || continue
+
+  if grep -En "api\\.anthropic\\.com|new[[:space:]]+Anthropic[[:space:]]*\\(|fetch[[:space:]]*\\([^)]*[Aa]nthropic" "$f" 2>/dev/null \
+     | grep -vE '^[0-9]+:[[:space:]]*(//|\*)' | grep .; then
+    echo
+    echo "ERROR: $f adds a direct Anthropic endpoint/fetch/SDK constructor."
+    echo "       Only $DIRECT_ANTHROPIC_EXCEPTION may own the private raw transport."
+    FAILED=1
+  fi
+
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    body="${line#*:}"
+    if printf '%s' "$body" | grep -qE '^[[:space:]]*import[[:space:]]+type[[:space:]]'; then continue; fi
+    if printf '%s' "$body" | grep -qE '^[[:space:]]*(//|\*)'; then continue; fi
+    specifiers=$(printf '%s' "$body" | sed -nE 's/^[[:space:]]*import[[:space:]]+\{([^}]*)\}[[:space:]]+from.*/\1/p')
+    if [ -n "$specifiers" ]; then
+      has_value=0
+      while IFS= read -r spec; do
+        spec=$(printf '%s' "$spec" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')
+        [ -z "$spec" ] && continue
+        if ! printf '%s' "$spec" | grep -qE '^type[[:space:]]'; then has_value=1; fi
+      done < <(printf '%s' "$specifiers" | tr ',' '\n')
+      [ "$has_value" -eq 0 ] && continue
+    fi
+    echo "$line"
+    echo
+    echo "ERROR: $f adds a runtime @anthropic-ai/sdk import."
+    echo "       Only $DIRECT_ANTHROPIC_EXCEPTION may own direct Anthropic transport."
+    FAILED=1
+  done < <(grep -En "from[[:space:]]+['\"]@anthropic-ai/sdk['\"]|import[[:space:]]*\\([[:space:]]*['\"]@anthropic-ai/sdk['\"]" "$f" 2>/dev/null)
+done
+
 if [ "$FAILED" -eq 1 ]; then
   exit 1
 fi

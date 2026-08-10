@@ -6,15 +6,27 @@
 // VOYAGE_API_KEY) and the dual-engine parity gate lands in Phase 10.
 
 import { describe, expect, test, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { mkdtempSync, writeFileSync, copyFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, copyFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { importImageFile, isImageFilePath, pLimit, SUPPORTED_IMAGE_EXTS } from '../src/core/import-file.ts';
+import {
+  importImageFile,
+  importImageFileWithBoundedOcrText,
+  isImageFilePath,
+  pLimit,
+  SUPPORTED_IMAGE_EXTS,
+} from '../src/core/import-file.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { withImageImportFence } from '../src/core/image-import-fence.ts';
 
 let engine: PGLiteEngine;
 let tmpDir: string;
+
+function noEmbedOptions() {
+  return { noEmbed: true, imageImportFenceRoot: join(tmpDir, 'image-import-fence') } as const;
+}
 
 beforeAll(async () => {
   engine = new PGLiteEngine();
@@ -88,7 +100,7 @@ describe('importImageFile happy path (noEmbed)', () => {
     const target = join(tmpDir, 'photo.png');
     copyFileSync('test/fixtures/images/tiny.avif', target);
 
-    const result = await importImageFile(engine, target, 'originals/photos/photo.png', { noEmbed: true });
+    const result = await importImageFile(engine, target, 'originals/photos/photo.png', noEmbedOptions());
     expect(result.status).toBe('imported');
     expect(result.chunks).toBe(1);
 
@@ -114,10 +126,35 @@ describe('importImageFile happy path (noEmbed)', () => {
     const target = join(tmpDir, 'photo2.png');
     writeFileSync(target, Buffer.from('fake-png-bytes-stable'));
 
-    const r1 = await importImageFile(engine, target, 'photos/photo2.png', { noEmbed: true });
+    const r1 = await importImageFile(engine, target, 'photos/photo2.png', noEmbedOptions());
     expect(r1.status).toBe('imported');
-    const r2 = await importImageFile(engine, target, 'photos/photo2.png', { noEmbed: true });
+    const r2 = await importImageFile(engine, target, 'photos/photo2.png', noEmbedOptions());
     expect(r2.status).toBe('skipped');
+  });
+
+  test('bounded paid OCR upgrades a same-hash routine import instead of idempotently skipping', async () => {
+    const slug = 'photos/paid-upgrade.png';
+    const target = join(tmpDir, slug);
+    mkdirSync(join(tmpDir, 'photos'), { recursive: true });
+    writeFileSync(target, Buffer.from('same-image-bytes'));
+
+    const routine = await importImageFile(engine, target, slug, noEmbedOptions());
+    expect(routine.status).toBe('imported');
+    const bytes = Buffer.from('same-image-bytes');
+    await withImageImportFence(token => importImageFileWithBoundedOcrText(
+      engine,
+      target,
+      slug,
+      'default',
+      tmpDir,
+      createHash('sha256').update(bytes).digest('hex'),
+      'PAID OCR RESULT',
+      token,
+    ), { lockRoot: join(tmpDir, 'image-import-fence') });
+
+    const chunks = await engine.getChunks(slug);
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].chunk_text).toBe('PAID OCR RESULT');
   });
 
   test('routes page, chunks, and file metadata to the requested source (#2706)', async () => {
@@ -131,6 +168,7 @@ describe('importImageFile happy path (noEmbed)', () => {
     const result = await importImageFile(engine, target, 'photos/source-photo.png', {
       noEmbed: true,
       sourceId: 'image-source',
+      imageImportFenceRoot: join(tmpDir, 'image-import-fence'),
     });
 
     expect(result.status).toBe('imported');
@@ -147,7 +185,7 @@ describe('importImageFile happy path (noEmbed)', () => {
     const target = join(tmpDir, 'huge.png');
     // Write a 21MB file. Buffer.alloc is fast.
     writeFileSync(target, Buffer.alloc(21 * 1024 * 1024));
-    const result = await importImageFile(engine, target, 'photos/huge.png', { noEmbed: true });
+    const result = await importImageFile(engine, target, 'photos/huge.png', noEmbedOptions());
     expect(result.status).toBe('skipped');
     expect(result.error).toMatch(/Image too large/);
   });

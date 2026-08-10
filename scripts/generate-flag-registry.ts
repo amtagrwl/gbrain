@@ -36,6 +36,11 @@ const EXTRA_FLAGS: Record<string, string[]> = {
   sync: ['--pace', '--pace-max-concurrency'],
 };
 
+/** Spend/security boundaries whose legal surface must not inherit prose flags. */
+const EXACT_FLAGS: Record<string, string[]> = {
+  'image-ocr-run': ['--brain', '--help', '--max-images', '--max-usd', '--reserve-usd-per-call', '--yes'],
+};
+
 /** Universal helper flags every command may see (parsed or short-circuited upstream). */
 const UNIVERSAL_FLAGS = ['--help', '--json', '--brain', '--source'];
 
@@ -118,6 +123,10 @@ export function buildFlagRegistry(): Record<string, string[]> {
 
   const registry: Record<string, string[]> = {};
   for (const command of commands) {
+    if (EXACT_FLAGS[command]) {
+      registry[command] = [...new Set(EXACT_FLAGS[command])].sort();
+      continue;
+    }
     const block = blocks.get(command) ?? '';
     const flags = new Set<string>(UNIVERSAL_FLAGS);
     const depthZero = new Set<string>();
