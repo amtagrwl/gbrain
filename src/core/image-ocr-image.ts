@@ -1,5 +1,19 @@
-import { extname } from 'node:path';
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import {
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { extname, join } from 'node:path';
 import { canonicalLookup } from './model-pricing.ts';
 import {
   IMAGE_OCR_POLICY_MAX_OUTPUT_TOKENS,
@@ -13,6 +27,10 @@ export const IMAGE_OCR_STANDARD_MAX_PIXELS = 1_150_000;
 export const IMAGE_OCR_TOKEN_PIXEL_DIVISOR = 750;
 export const IMAGE_OCR_MAX_VISUAL_TOKENS = 1_568;
 export const IMAGE_OCR_NONVISUAL_INPUT_TOKEN_ALLOWANCE = 500;
+
+const IMAGE_OCR_NATIVE_DECODER = '/usr/bin/sips';
+const IMAGE_OCR_NATIVE_DECODE_TIMEOUT_MS = 30_000;
+const IMAGE_OCR_NATIVE_MAX_PNG_BYTES = IMAGE_OCR_LOCAL_MAX_PIXELS * 4 + 1024 * 1024;
 
 const pricing = canonicalLookup(`anthropic:${IMAGE_OCR_POLICY_MODEL}`);
 if (!pricing) throw new Error(`Missing canonical pricing for ${IMAGE_OCR_POLICY_MODEL}`);
@@ -459,6 +477,107 @@ async function preparePng(bytes: Buffer): Promise<PreparedBoundedImageOcrBytes> 
   return { buf: bytes, mime: 'image/png', info };
 }
 
+function decodeNativeCodecToPng(
+  bytes: Buffer,
+  format: 'jpeg' | 'gif' | 'webp',
+): Buffer {
+  const directory = mkdtempSync(join(tmpdir(), 'gbrain-image-ocr-decode-'));
+  chmodSync(directory, 0o700);
+  const extension = format === 'jpeg' ? 'jpg' : format;
+  const inputPath = join(directory, `input.${extension}`);
+  const outputPath = join(directory, 'output.png');
+  const noFollow = typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0;
+  try {
+    const inputFd = openSync(
+      inputPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | noFollow,
+      0o600,
+    );
+    try {
+      writeFileSync(inputFd, bytes);
+      fsyncSync(inputFd);
+    } finally {
+      closeSync(inputFd);
+    }
+
+    const result = spawnSync(
+      IMAGE_OCR_NATIVE_DECODER,
+      ['-s', 'format', 'png', inputPath, '--out', outputPath],
+      {
+        encoding: 'buffer',
+        env: { PATH: '/usr/bin:/bin', TMPDIR: directory, LANG: 'C' },
+        maxBuffer: 64 * 1024,
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: IMAGE_OCR_NATIVE_DECODE_TIMEOUT_MS,
+        windowsHide: true,
+      },
+    );
+    if (
+      result.error
+      || result.signal !== null
+      || result.status !== 0
+      || result.stderr.length !== 0
+    ) {
+      throw new Error(`Image OCR could not fully decode ${format}`);
+    }
+
+    const visibleOutput = lstatSync(outputPath);
+    if (
+      visibleOutput.isSymbolicLink()
+      || !visibleOutput.isFile()
+      || visibleOutput.size <= 0
+      || visibleOutput.size > IMAGE_OCR_NATIVE_MAX_PNG_BYTES
+    ) {
+      throw new Error(`Image OCR native ${format} decoder produced invalid output`);
+    }
+    const outputFd = openSync(outputPath, fsConstants.O_RDONLY | noFollow);
+    try {
+      const before = fstatSync(outputFd);
+      if (
+        !before.isFile()
+        || before.dev !== visibleOutput.dev
+        || before.ino !== visibleOutput.ino
+        || before.size !== visibleOutput.size
+      ) {
+        throw new Error(`Image OCR native ${format} output identity changed`);
+      }
+      const output = readFileSync(outputFd);
+      const after = fstatSync(outputFd);
+      if (
+        after.dev !== before.dev
+        || after.ino !== before.ino
+        || after.size !== before.size
+        || output.length !== before.size
+      ) {
+        throw new Error(`Image OCR native ${format} output changed while reading`);
+      }
+      return output;
+    } finally {
+      closeSync(outputFd);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+async function prepareNativeCodec(
+  bytes: Buffer,
+  info: BoundedImageOcrInfo,
+  format: 'jpeg' | 'gif' | 'webp',
+): Promise<PreparedBoundedImageOcrBytes> {
+  const decodedPng = await preparePng(decodeNativeCodecToPng(bytes, format));
+  if (
+    decodedPng.info.width !== info.width
+    || decodedPng.info.height !== info.height
+    || decodedPng.info.pixels !== info.pixels
+    || decodedPng.info.frameCount !== info.frameCount
+  ) {
+    throw new Error(`Decoded ${format} dimensions or frame count disagree with bounded metadata`);
+  }
+  return { buf: decodedPng.buf, mime: 'image/png', info };
+}
+
 interface HeicImageHandle {
   width: number;
   height: number;
@@ -520,11 +639,11 @@ export async function prepareBoundedImageOcrBytes(
       return preparePng(bytes);
     case '.jpg':
     case '.jpeg':
-      return { buf: bytes, mime: 'image/jpeg', info: inspectJpeg(bytes) };
+      return prepareNativeCodec(bytes, inspectJpeg(bytes), 'jpeg');
     case '.gif':
-      return { buf: bytes, mime: 'image/gif', info: inspectGif(bytes) };
+      return prepareNativeCodec(bytes, inspectGif(bytes), 'gif');
     case '.webp':
-      return { buf: bytes, mime: 'image/webp', info: inspectWebp(bytes) };
+      return prepareNativeCodec(bytes, inspectWebp(bytes), 'webp');
     case '.heic':
     case '.heif':
       return prepareHeic(bytes);

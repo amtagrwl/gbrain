@@ -42,11 +42,13 @@ interface LedgerAuditEntry {
   registered_root: string;
   sha256: string;
   reserved_usd_micros: number;
-  state: 'reserved' | 'transport_attempted' | 'receipt_validated' | 'persisted' | 'failed';
+  max_input_tokens: number | null;
+  state: 'reserved' | 'transport_attempted' | 'receipt_validated' | 'invalid_provider_observation' | 'persisted' | 'failed';
   transport_attempted: boolean;
   provider_receipt: LedgerProviderReceipt | null;
+  invalid_provider_observation: LedgerInvalidProviderObservation | null;
   persistence_succeeded: boolean;
-  outcome: 'pending' | 'ambiguous' | 'persisted' | 'failed';
+  outcome: 'pending' | 'ambiguous' | 'invalid' | 'over_limit' | 'persisted' | 'failed';
   failure_stage: OcrFailureStage | null;
 }
 
@@ -59,6 +61,11 @@ interface LedgerProviderReceipt {
   cache_read_input_tokens: number;
   output_tokens: number;
   actual_usd_micros: number;
+}
+
+interface LedgerInvalidProviderObservation extends LedgerProviderReceipt {
+  outcome: OcrInvalidProviderObservationOutcome;
+  limit_violations: OcrProviderLimitViolation[];
 }
 
 interface LedgerFile {
@@ -129,6 +136,8 @@ export interface OcrReservation {
   readonly filePath: string;
   readonly registeredRoot: string;
   readonly sha256: string;
+  readonly maxInputTokens: number | null;
+  readonly reservedUsd: number;
 }
 
 export type OcrFailureStage =
@@ -149,6 +158,15 @@ export interface OcrReceiptAccounting {
   readonly cacheReadInputTokens: number;
   readonly outputTokens: number;
   readonly actualUsd: number;
+}
+
+export type OcrInvalidProviderObservationOutcome = 'invalid' | 'over_limit';
+
+export type OcrProviderLimitViolation = 'input_tokens' | 'output_tokens' | 'actual_usd';
+
+export interface OcrInvalidProviderObservationAccounting extends OcrReceiptAccounting {
+  readonly outcome: OcrInvalidProviderObservationOutcome;
+  readonly limitViolations: readonly OcrProviderLimitViolation[];
 }
 
 function usdToMicros(value: number): number {
@@ -341,7 +359,7 @@ function writeLedgerDurably(path: string, ledger: LedgerFile): void {
   fsyncDirectory(dirname(path));
 }
 
-function providerReceiptIsValid(receipt: LedgerProviderReceipt | null): boolean {
+function providerAccountingIsValid(receipt: LedgerProviderReceipt | null): receipt is LedgerProviderReceipt {
   const price = canonicalLookup(IMAGE_OCR_POLICY_MODEL);
   return !!receipt && !!price
     && typeof receipt.request_id === 'string' && receipt.request_id.length > 0
@@ -357,6 +375,41 @@ function providerReceiptIsValid(receipt: LedgerProviderReceipt | null): boolean 
     );
 }
 
+function providerReceiptIsValid(receipt: LedgerProviderReceipt | null, entry: LedgerAuditEntry): boolean {
+  return providerAccountingIsValid(receipt)
+    && receipt.output_tokens <= IMAGE_OCR_POLICY_MAX_OUTPUT_TOKENS
+    && (entry.max_input_tokens === null || receipt.input_tokens <= entry.max_input_tokens)
+    && receipt.actual_usd_micros <= entry.reserved_usd_micros;
+}
+
+function invalidProviderObservationIsValid(
+  observation: LedgerInvalidProviderObservation | null,
+  entry: LedgerAuditEntry,
+): boolean {
+  if (!providerAccountingIsValid(observation)) return false;
+  if (!['invalid', 'over_limit'].includes(observation.outcome)) return false;
+  if (
+    !Array.isArray(observation.limit_violations)
+    || observation.limit_violations.some(value => !['input_tokens', 'output_tokens', 'actual_usd'].includes(value))
+    || new Set(observation.limit_violations).size !== observation.limit_violations.length
+  ) return false;
+  const expectedViolations: OcrProviderLimitViolation[] = [];
+  if (entry.max_input_tokens !== null && observation.input_tokens > entry.max_input_tokens) {
+    expectedViolations.push('input_tokens');
+  }
+  if (observation.output_tokens > IMAGE_OCR_POLICY_MAX_OUTPUT_TOKENS) {
+    expectedViolations.push('output_tokens');
+  }
+  if (observation.actual_usd_micros > entry.reserved_usd_micros) {
+    expectedViolations.push('actual_usd');
+  }
+  if (observation.outcome === 'over_limit') {
+    return expectedViolations.length > 0
+      && observation.limit_violations.join('\0') === expectedViolations.join('\0');
+  }
+  return observation.limit_violations.length === 0;
+}
+
 function auditLifecycleIsValid(entry: LedgerAuditEntry): boolean {
   const failureStages: ReadonlySet<string> = new Set([
     'post_reservation_validation',
@@ -368,30 +421,42 @@ function auditLifecycleIsValid(entry: LedgerAuditEntry): boolean {
   if (
     typeof entry.transport_attempted !== 'boolean'
     || typeof entry.persistence_succeeded !== 'boolean'
-    || !['reserved', 'transport_attempted', 'receipt_validated', 'persisted', 'failed'].includes(entry.state)
-    || !['pending', 'ambiguous', 'persisted', 'failed'].includes(entry.outcome)
+    || !(entry.max_input_tokens === null || (Number.isSafeInteger(entry.max_input_tokens) && entry.max_input_tokens >= 0))
+    || !['reserved', 'transport_attempted', 'receipt_validated', 'invalid_provider_observation', 'persisted', 'failed'].includes(entry.state)
+    || !['pending', 'ambiguous', 'invalid', 'over_limit', 'persisted', 'failed'].includes(entry.outcome)
     || !(entry.failure_stage === null || failureStages.has(entry.failure_stage))
   ) return false;
 
   switch (entry.state) {
     case 'reserved':
       return !entry.transport_attempted && entry.provider_receipt === null
+        && entry.invalid_provider_observation === null
         && !entry.persistence_succeeded && entry.outcome === 'pending' && entry.failure_stage === null;
     case 'transport_attempted':
       return entry.transport_attempted && entry.provider_receipt === null
+        && entry.invalid_provider_observation === null
         && !entry.persistence_succeeded && entry.outcome === 'ambiguous' && entry.failure_stage === null;
     case 'receipt_validated':
-      return entry.transport_attempted && providerReceiptIsValid(entry.provider_receipt)
+      return entry.transport_attempted && providerReceiptIsValid(entry.provider_receipt, entry)
+        && entry.invalid_provider_observation === null
         && !entry.persistence_succeeded && entry.outcome === 'pending' && entry.failure_stage === null;
+    case 'invalid_provider_observation':
+      return entry.transport_attempted && entry.provider_receipt === null
+        && invalidProviderObservationIsValid(entry.invalid_provider_observation, entry)
+        && !entry.persistence_succeeded
+        && entry.outcome === entry.invalid_provider_observation?.outcome
+        && entry.failure_stage === 'provider_receipt';
     case 'persisted':
-      return entry.transport_attempted && providerReceiptIsValid(entry.provider_receipt)
+      return entry.transport_attempted && providerReceiptIsValid(entry.provider_receipt, entry)
+        && entry.invalid_provider_observation === null
         && entry.persistence_succeeded && entry.outcome === 'persisted' && entry.failure_stage === null;
     case 'failed':
       if (
         entry.persistence_succeeded
+        || entry.invalid_provider_observation !== null
         || entry.failure_stage === null
         || (entry.outcome !== 'failed' && entry.outcome !== 'ambiguous')
-        || (entry.provider_receipt && (!entry.transport_attempted || !providerReceiptIsValid(entry.provider_receipt)))
+        || (entry.provider_receipt && (!entry.transport_attempted || !providerReceiptIsValid(entry.provider_receipt, entry)))
       ) return false;
       if (entry.failure_stage === 'post_reservation_validation') {
         return !entry.transport_attempted && entry.provider_receipt === null && entry.outcome === 'failed';
@@ -400,35 +465,51 @@ function auditLifecycleIsValid(entry: LedgerAuditEntry): boolean {
         return entry.transport_attempted && entry.provider_receipt === null && entry.outcome === 'ambiguous';
       }
       if (entry.failure_stage === 'persistence') {
-        return entry.transport_attempted && providerReceiptIsValid(entry.provider_receipt);
+        return entry.transport_attempted && providerReceiptIsValid(entry.provider_receipt, entry);
       }
       return !entry.persistence_succeeded
         && entry.failure_stage !== null
         && (entry.outcome === 'failed' || entry.outcome === 'ambiguous')
-        && (!entry.provider_receipt || (entry.transport_attempted && providerReceiptIsValid(entry.provider_receipt)));
+        && (!entry.provider_receipt || (entry.transport_attempted && providerReceiptIsValid(entry.provider_receipt, entry)));
   }
+}
+
+function normalizeLedgerAuditEntry(value: unknown, expectedDate: string): LedgerAuditEntry | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const entry = {
+    ...raw,
+    max_input_tokens: raw.max_input_tokens ?? null,
+    invalid_provider_observation: raw.invalid_provider_observation ?? null,
+  } as unknown as LedgerAuditEntry;
+  if (
+    !/^[a-f0-9]{64}$/.test(entry.reservation_id)
+    || typeof entry.reserved_at !== 'string'
+    || entry.reserved_at.slice(0, 10) !== expectedDate
+    || !/^[a-f0-9]{64}$/.test(entry.manifest_hash)
+    || !Number.isSafeInteger(entry.entry_index) || entry.entry_index < 0
+    || typeof entry.source_id !== 'string' || entry.source_id.length === 0
+    || typeof entry.slug !== 'string' || entry.slug.length === 0
+    || typeof entry.file_path !== 'string' || !entry.file_path.startsWith('/')
+    || typeof entry.registered_root !== 'string' || !entry.registered_root.startsWith('/')
+    || !/^[a-f0-9]{64}$/.test(entry.sha256)
+    || !Number.isSafeInteger(entry.reserved_usd_micros)
+    || entry.reserved_usd_micros < usdToMicros(IMAGE_OCR_POLICY_MIN_RESERVE_USD)
+    || !(entry.invalid_provider_observation === null
+      || (typeof entry.invalid_provider_observation === 'object'
+        && !Array.isArray(entry.invalid_provider_observation)))
+    || !auditLifecycleIsValid(entry)
+  ) return null;
+  return entry;
 }
 
 function parseLedger(path: string, expectedDate: string): LedgerFile {
   const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<LedgerFile>;
-  const auditValid = Array.isArray(parsed.audit) && parsed.audit.every((entry): entry is LedgerAuditEntry => (
-    !!entry
-    && typeof entry === 'object'
-    && /^[a-f0-9]{64}$/.test(entry.reservation_id)
-    && typeof entry.reserved_at === 'string'
-    && entry.reserved_at.slice(0, 10) === expectedDate
-    && /^[a-f0-9]{64}$/.test(entry.manifest_hash)
-    && Number.isSafeInteger(entry.entry_index) && entry.entry_index >= 0
-    && typeof entry.source_id === 'string' && entry.source_id.length > 0
-    && typeof entry.slug === 'string' && entry.slug.length > 0
-    && typeof entry.file_path === 'string' && entry.file_path.startsWith('/')
-    && typeof entry.registered_root === 'string' && entry.registered_root.startsWith('/')
-    && /^[a-f0-9]{64}$/.test(entry.sha256)
-    && Number.isSafeInteger(entry.reserved_usd_micros)
-    && entry.reserved_usd_micros >= usdToMicros(IMAGE_OCR_POLICY_MIN_RESERVE_USD)
-    && auditLifecycleIsValid(entry)
-  ));
-  const audit = auditValid ? parsed.audit as LedgerAuditEntry[] : [];
+  const normalizedAudit = Array.isArray(parsed.audit)
+    ? parsed.audit.map(entry => normalizeLedgerAuditEntry(entry, expectedDate))
+    : [];
+  const auditValid = Array.isArray(parsed.audit) && normalizedAudit.every(entry => entry !== null);
+  const audit = auditValid ? normalizedAudit as LedgerAuditEntry[] : [];
   const auditUsd = audit.reduce((sum, entry) => sum + entry.reserved_usd_micros, 0);
   if (
     parsed.schema_version !== 2
@@ -451,7 +532,7 @@ function parseLedger(path: string, expectedDate: string): LedgerFile {
   ) {
     throw new Error(`Invalid or ambiguous image OCR budget ledger: ${path}`);
   }
-  return parsed as LedgerFile;
+  return { ...parsed, audit } as LedgerFile;
 }
 
 export class OcrBudgetLedger {
@@ -544,12 +625,24 @@ export class OcrBudgetLedger {
     return null;
   }
 
-  reserve(entry: { index: number; sourceId: string; slug: string; filePath: string; registeredRoot: string; sha256: string }): OcrReservation {
+  reserve(entry: {
+    index: number;
+    sourceId: string;
+    slug: string;
+    filePath: string;
+    registeredRoot: string;
+    sha256: string;
+    maxInputTokens?: number;
+  }): OcrReservation {
     if (this.closed) throw new Error('Image OCR budget ledger is closed');
     if (!verifyBudgetLockOwnership(this.lock)) throw new OcrBudgetLockError(this.lock.lockPath);
     const exceeded = this.nextCapExceeded();
     if (exceeded) throw new OcrBudgetCapError(exceeded);
     const reserveMicros = usdToMicros(this.caps.reserveUsdPerCall);
+    const maxInputTokens = entry.maxInputTokens ?? null;
+    if (maxInputTokens !== null && (!Number.isSafeInteger(maxInputTokens) || maxInputTokens < 0)) {
+      throw new Error('Invalid OCR request-specific input token ceiling');
+    }
     const reservationId = randomBytes(32).toString('hex');
     const reservation: OcrReservation = Object.freeze({
       reservationId,
@@ -559,6 +652,8 @@ export class OcrBudgetLedger {
       filePath: entry.filePath,
       registeredRoot: entry.registeredRoot,
       sha256: entry.sha256,
+      maxInputTokens,
+      reservedUsd: microsToUsd(reserveMicros),
     });
     this.ledger = {
       ...this.ledger,
@@ -575,9 +670,11 @@ export class OcrBudgetLedger {
         registered_root: entry.registeredRoot,
         sha256: entry.sha256,
         reserved_usd_micros: reserveMicros,
+        max_input_tokens: maxInputTokens,
         state: 'reserved',
         transport_attempted: false,
         provider_receipt: null,
+        invalid_provider_observation: null,
         persistence_succeeded: false,
         outcome: 'pending',
         failure_stage: null,
@@ -613,12 +710,45 @@ export class OcrBudgetLedger {
         output_tokens: receipt.outputTokens,
         actual_usd_micros: actualUsdMicros,
       };
-      if (!providerReceiptIsValid(providerReceipt)) throw new Error('Invalid OCR provider receipt accounting');
+      if (!providerReceiptIsValid(providerReceipt, entry)) throw new Error('Invalid OCR provider receipt accounting');
       return {
         ...entry,
         state: 'receipt_validated',
         provider_receipt: providerReceipt,
         outcome: 'pending',
+      };
+    });
+  }
+
+  recordInvalidProviderObservation(
+    reservation: OcrReservation,
+    observation: OcrInvalidProviderObservationAccounting,
+  ): void {
+    this.updateReservation(reservation, (entry) => {
+      if (entry.state !== 'transport_attempted') {
+        throw new Error('Invalid OCR audit transition to invalid_provider_observation');
+      }
+      const invalidObservation: LedgerInvalidProviderObservation = {
+        request_id: observation.requestId,
+        model: observation.model,
+        stop_reason: observation.stopReason,
+        input_tokens: observation.inputTokens,
+        cache_creation_input_tokens: observation.cacheCreationInputTokens,
+        cache_read_input_tokens: observation.cacheReadInputTokens,
+        output_tokens: observation.outputTokens,
+        actual_usd_micros: usdToMicros(observation.actualUsd),
+        outcome: observation.outcome,
+        limit_violations: [...observation.limitViolations],
+      };
+      if (!invalidProviderObservationIsValid(invalidObservation, entry)) {
+        throw new Error('Invalid OCR provider observation accounting');
+      }
+      return {
+        ...entry,
+        state: 'invalid_provider_observation',
+        invalid_provider_observation: invalidObservation,
+        outcome: observation.outcome,
+        failure_stage: 'provider_receipt',
       };
     });
   }
@@ -641,7 +771,11 @@ export class OcrBudgetLedger {
     outcome: OcrFailureOutcome,
   ): void {
     this.updateReservation(reservation, (entry) => {
-      if (entry.state === 'persisted' || entry.state === 'failed') {
+      if (
+        entry.state === 'persisted'
+        || entry.state === 'invalid_provider_observation'
+        || entry.state === 'failed'
+      ) {
         throw new Error('Invalid OCR audit transition to failed');
       }
       return {

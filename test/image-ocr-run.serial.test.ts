@@ -47,6 +47,7 @@ import {
   IMAGE_OCR_NONVISUAL_INPUT_TOKEN_ALLOWANCE,
   IMAGE_OCR_OUTPUT_USD_PER_MTOK,
   buildBoundedImageOcrRequestBody,
+  parseBoundedImageOcrReceipt,
   requestBoundedImageOcr,
   type BoundedImageOcrReceipt,
 } from '../src/core/image-ocr-provider.ts';
@@ -96,6 +97,22 @@ function injectedReceipt(text = 'verbatim text'): BoundedImageOcrReceipt {
   };
 }
 
+function injectedReceiptWithUsage(
+  inputTokens: number,
+  outputTokens: number,
+  text = 'verbatim text',
+): BoundedImageOcrReceipt {
+  return {
+    ...injectedReceipt(text),
+    inputTokens,
+    outputTokens,
+    actualUsd: (
+      inputTokens * IMAGE_OCR_INPUT_USD_PER_MTOK
+      + outputTokens * IMAGE_OCR_OUTPUT_USD_PER_MTOK
+    ) / 1_000_000,
+  };
+}
+
 function sha256(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
@@ -125,6 +142,37 @@ function animatedGif(): Buffer {
     TINY_GIF.subarray(imageStart, trailer),
     TINY_GIF.subarray(trailer),
   ]);
+}
+
+function jpegWithTruncatedEntropyStream(): Buffer {
+  const startOfScan = TINY_JPEG.indexOf(Buffer.from([0xff, 0xda]));
+  if (startOfScan < 0) throw new Error('Tiny JPEG fixture lacks SOS');
+  const scanDataStart = startOfScan + 2 + TINY_JPEG.readUInt16BE(startOfScan + 2);
+  return Buffer.concat([
+    TINY_JPEG.subarray(0, scanDataStart),
+    Buffer.from([0xff, 0xd9]),
+  ]);
+}
+
+function gifWithTruncatedLzwPayload(): Buffer {
+  const bytes = Buffer.from(TINY_GIF);
+  const imageDescriptor = bytes.indexOf(0x2c);
+  if (imageDescriptor < 0) throw new Error('Tiny GIF fixture lacks an image descriptor');
+  bytes.writeUInt16LE(1_000, 6);
+  bytes.writeUInt16LE(1_000, 8);
+  bytes.writeUInt16LE(1_000, imageDescriptor + 5);
+  bytes.writeUInt16LE(1_000, imageDescriptor + 7);
+  return bytes;
+}
+
+function webpWithTruncatedVp8Payload(): Buffer {
+  const vp8DataStart = 20;
+  const bytes = Buffer.from(TINY_WEBP.subarray(0, vp8DataStart + 10));
+  bytes.writeUInt32LE(bytes.length - 8, 4);
+  bytes.writeUInt32LE(10, 16);
+  bytes.writeUInt16LE(1_000, vp8DataStart + 6);
+  bytes.writeUInt16LE(1_000, vp8DataStart + 8);
+  return bytes;
 }
 
 function reservationFields(filePath = '/tmp/image.png', hash = 'a'.repeat(64), registeredRoot = dirname(filePath)) {
@@ -485,6 +533,33 @@ describe('manifest preflight', () => {
       expect(report).toMatchObject({ status: 'rejected', processed: 0, terminal_error: 'manifest_invalid' });
     }
   });
+
+  for (const codec of [
+    { name: 'JPEG', extension: '.jpg', bytes: jpegWithTruncatedEntropyStream() },
+    { name: 'GIF', extension: '.gif', bytes: gifWithTruncatedLzwPayload() },
+    { name: 'WebP', extension: '.webp', bytes: webpWithTruncatedVp8Payload() },
+  ]) {
+    test(`corrupt ${codec.name} compressed payload fails before reservation or transport`, async () => {
+      const f = fixture();
+      replaceFixtureImage(f, codec.bytes, codec.extension);
+      let providerCalls = 0;
+      const report = await runCommand(f, undefined, {
+        ocrProvider: async () => {
+          providerCalls++;
+          return injectedReceipt('MUST NOT RUN');
+        },
+      });
+      expect(providerCalls).toBe(0);
+      expect(report).toMatchObject({
+        status: 'rejected',
+        processed: 0,
+        reservations: 0,
+        provider_attempts: 0,
+        terminal_error: 'manifest_invalid',
+      });
+      expect(existsSync(join(f.ledgerDir, '2026-08-10.json'))).toBe(false);
+    });
+  }
 
   test('animated or multiframe content is rejected before reservation or transport', async () => {
     const f = fixture();
@@ -1102,6 +1177,8 @@ describe('bounded run behavior', () => {
     const receipt = await requestBoundedImageOcr({
       apiKey: 'test-key',
       body,
+      maxInputTokens: 600,
+      reservedUsd: 0.01,
       onTransportAttempt: () => { transportAttempts++; },
       fetchImpl: async (url, init) => {
         calls.push({ url: String(url), init: init ?? {} });
@@ -1179,12 +1256,123 @@ describe('bounded run behavior', () => {
       await expect(requestBoundedImageOcr({
         apiKey: 'test-key',
         body,
+        maxInputTokens: 600,
+        reservedUsd: 0.01,
         fetchImpl: async () => new Response(JSON.stringify(responseBody), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         }),
       })).rejects.toThrow();
     }
+  });
+
+  test('enforces the exact request input, output, and durable reservation envelope', () => {
+    const exactBoundary = parseBoundedImageOcrReceipt(anthropicMessageResponse({
+      usage: {
+        input_tokens: 501,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        output_tokens: IMAGE_OCR_POLICY_MAX_OUTPUT_TOKENS,
+      },
+    }), {
+      maxInputTokens: 501,
+      reservedUsd: 0.01,
+    });
+    expect(exactBoundary).toMatchObject({
+      inputTokens: 501,
+      outputTokens: IMAGE_OCR_POLICY_MAX_OUTPUT_TOKENS,
+      actualUsd: 0.005621,
+    });
+
+    expect(() => parseBoundedImageOcrReceipt(anthropicMessageResponse({
+      usage: {
+        input_tokens: 502,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        output_tokens: 0,
+      },
+    }), { maxInputTokens: 501, reservedUsd: 0.01 })).toThrow();
+
+    expect(() => parseBoundedImageOcrReceipt(anthropicMessageResponse({
+      usage: {
+        input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        output_tokens: IMAGE_OCR_POLICY_MAX_OUTPUT_TOKENS + 1,
+      },
+    }), { maxInputTokens: 501, reservedUsd: 0.01 })).toThrow();
+
+    expect(() => parseBoundedImageOcrReceipt(anthropicMessageResponse(), {
+      maxInputTokens: 501,
+      reservedUsd: 0.000149,
+    })).toThrow();
+  });
+
+  test('accounts an over-limit received response without accepting or persisting it', async () => {
+    const f = fixture(2);
+    const state = statefulImageEngine(f.root);
+    f.engine = state.engine;
+    let providerCalls = 0;
+    const overLimit = injectedReceiptWithUsage(
+      1_000_000,
+      IMAGE_OCR_POLICY_MAX_OUTPUT_TOKENS + 1,
+      'MUST NOT PERSIST',
+    );
+
+    const report = await runCommand(
+      f,
+      { maxImages: 2, maxUsd: 1, reserveUsdPerCall: 0.01 },
+      {
+        ocrProvider: async () => {
+          providerCalls++;
+          return overLimit;
+        },
+      },
+    );
+
+    expect(providerCalls).toBe(1);
+    expect(report).toMatchObject({
+      status: 'failed',
+      requested: 2,
+      processed: 1,
+      failed: 1,
+      skipped: 1,
+      reservations: 1,
+      provider_attempts: 1,
+      successful_provider_receipts: 0,
+      observed_input_tokens: 1_000_000,
+      observed_cache_creation_input_tokens: 0,
+      observed_cache_read_input_tokens: 0,
+      observed_output_tokens: IMAGE_OCR_POLICY_MAX_OUTPUT_TOKENS + 1,
+      observed_usd: 1.005125,
+      persisted_imports: 0,
+      failures: 1,
+    });
+    expect(state.pages.size).toBe(0);
+    expect(state.chunks.size).toBe(0);
+    const audit = JSON.parse(readFileSync(join(f.ledgerDir, '2026-08-10.json'), 'utf8')).audit[0];
+    expect(audit).toMatchObject({
+      reserved_usd_micros: 10_000,
+      max_input_tokens: 501,
+      state: 'invalid_provider_observation',
+      transport_attempted: true,
+      provider_receipt: null,
+      persistence_succeeded: false,
+      outcome: 'over_limit',
+      failure_stage: 'provider_receipt',
+      invalid_provider_observation: {
+        outcome: 'over_limit',
+        request_id: 'msg_injected_123',
+        model: IMAGE_OCR_POLICY_MODEL,
+        stop_reason: 'end_turn',
+        input_tokens: 1_000_000,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        output_tokens: IMAGE_OCR_POLICY_MAX_OUTPUT_TOKENS + 1,
+        actual_usd_micros: 1_005_125,
+      },
+    });
+    expect(JSON.stringify(audit)).not.toContain('MUST NOT PERSIST');
   });
 
   test('native fetch rejects redirects without sending the OCR request to the redirect target', async () => {
@@ -1212,6 +1400,8 @@ describe('bounded run behavior', () => {
       await expect(requestBoundedImageOcr({
         apiKey: 'test-key',
         body,
+        maxInputTokens: 600,
+        reservedUsd: 0.01,
         fetchImpl: (_url, init) => fetch(`http://127.0.0.1:${address.port}/start`, init),
       })).rejects.toThrow();
       expect(paths).toEqual(['/start']);

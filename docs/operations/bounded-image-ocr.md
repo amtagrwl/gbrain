@@ -33,20 +33,26 @@ Any mismatch rejects the whole run before the first reservation or provider call
 The actual magic, structure, single-frame status, dimensions, and decoded-pixel
 bound are validated for PNG, JPEG, GIF, WebP, HEIC/HEIF, and AVIF. Zero-byte,
 malformed, animated/multiframe, zero-dimension, over-8,000-pixel-dimension, and
-over-25,000,000-decoded-pixel inputs fail before reservation. PNG, HEIC/HEIF,
-and AVIF use the installed decoders after bounded metadata inspection; HEIC
-frame handles and AVIF `ispe` metadata are checked before an RGBA decode can be
-requested. HEIC/HEIF and AVIF are re-encoded to a validated PNG wire payload.
-The remaining codecs use strict bounded container/frame parsers. If a supported
-codec cannot satisfy these checks, the paid lane rejects it rather than weakening
-the bound.
+over-25,000,000-decoded-pixel inputs fail before reservation. Strict container
+inspection bounds dimensions and frame count before any decode allocation. PNG,
+HEIC/HEIF, and AVIF then use their installed decoders; HEIC frame handles and
+AVIF `ispe` metadata are checked before an RGBA decode can be requested. On
+macOS, JPEG/GIF/WebP are fully decoded through ImageIO using `/usr/bin/sips`
+without a shell, inside a private temporary directory with no-follow file opens,
+strict process/output checks, and guaranteed cleanup. The resulting PNG is
+structure-checked and fully decoded again, and its dimensions/frame count must
+match the bounded source metadata. JPEG/GIF/WebP, HEIC/HEIF, and AVIF provider
+payloads are therefore re-encoded to validated PNG. If the required decoder is
+unavailable on a platform, the paid lane rejects the codec rather than falling
+back to metadata-only acceptance.
 
 After the durable reservation, the command repeats byte, SHA, file identity,
-format, frame, dimension, pixel, token, source-root, and source-scoped page-state
-validation from a no-follow file descriptor. It builds the wire body from that
-validated snapshot. There is no await point between the final synchronous
-file/body check and transport dispatch. Any drift consumes the conservative
-reservation but makes zero transport attempts. A named cross-process image-import
+full compressed decode, PNG re-encoding, format, frame, dimension, pixel, token,
+source-root, and source-scoped page-state validation from a no-follow file
+descriptor. It builds the wire body from that validated snapshot. There is no
+await point between the final synchronous file/body check and transport dispatch.
+Any drift consumes the conservative reservation but makes zero transport
+attempts. A named cross-process image-import
 fence is held from final revalidation through provider access and OCR persistence;
 routine image imports acquire the same fence. Already-imported exact hashes make
 zero provider calls. Files larger than 20 MB, or whose exact serialized UTF-8
@@ -100,22 +106,32 @@ loosen them. A crash
 after reservation over-counts safely. An existing, stale, or ambiguous fence or
 ledger lock is never broken automatically; the run fails closed for operator
 review and requires manual recovery after confirming no holder remains. Ledger
-schema 2 gives every reservation a random ID and a durable lifecycle state:
-`reserved`, `transport_attempted`, `receipt_validated`, `persisted`, or `failed`,
-with explicit pending/failed/ambiguous/persisted outcome, failure stage, receipt,
-usage/cost, and persistence fields. A crash leaves its last conservative state
-in place and never refunds or reopens budget.
+schema 2 gives every reservation a random ID, its exact reserved USD and
+request-specific maximum input tokens, and a durable lifecycle state: `reserved`,
+`transport_attempted`, `receipt_validated`, `invalid_provider_observation`,
+`persisted`, or `failed`, with explicit pending/failed/ambiguous/invalid/
+over-limit/persisted outcome, failure stage, receipt or sanitized invalid
+observation, usage/cost, and persistence fields. A crash leaves its last
+conservative state in place and never refunds or reopens budget.
 
 Provider success is narrower than HTTP success. The response must be a Messages
 `message` for exactly `claude-haiku-4-5-20251001`, have a nonempty request ID,
 exactly one nonempty text block, `stop_reason: end_turn`, and finite nonnegative
-integer input, cache-creation, cache-read, and output usage fields. `max_tokens`,
-missing/invalid usage, model/type drift, multiple outputs, and empty text are
-rejected without persistence. This fixed request does not enable prompt caching;
-until cache-tier pricing is deliberately added to this pinned contract, nonzero
-cache usage is treated as unreconcilable and fails closed. For valid receipts,
-actual observed cost is computed from the canonical $1/$5 per-MTok rates. It is
-reconciliation data only; admission continues using the conservative reservation.
+integer input, cache-creation, cache-read, and output usage fields. Input usage
+may not exceed that image's validated visual tokens plus the pinned 500-token
+nonvisual allowance; output usage may not exceed the request's 1,024-token cap;
+and canonical observed USD may not exceed that attempt's exact durable
+reservation. `max_tokens`, missing/invalid usage, model/type drift, multiple
+outputs, empty text, and any envelope violation are rejected without persistence.
+This fixed request does not enable prompt caching; until cache-tier pricing is
+deliberately added to this pinned contract, nonzero cache usage is treated as
+unreconcilable and fails closed. An otherwise well-formed response that exceeds
+the input/output/cost envelope becomes a sanitized durable
+`invalid_provider_observation`: request ID, pinned model, stop reason, usage,
+computed USD, and the explicit over-limit reason are retained, but OCR text and
+the response body are not. Reports include that observed usage/cost while valid
+receipt and persisted-import counters remain zero, and the run stops immediately.
+Admission continues using the conservative reservation.
 
 At either cap, the next entry stops before provider or database access. HTTP
 redirects are rejected rather than followed, preserving the canonical endpoint

@@ -15,6 +15,7 @@ import {
   OcrBudgetLedger,
   type OcrFailureOutcome,
   type OcrFailureStage,
+  type OcrInvalidProviderObservationAccounting,
   type OcrReservation,
 } from '../core/image-ocr-budget.ts';
 import {
@@ -31,6 +32,7 @@ import {
 import {
   buildBoundedImageOcrRequestBody,
   BoundedImageOcrReceiptError,
+  IMAGE_OCR_NONVISUAL_INPUT_TOKEN_ALLOWANCE,
   loadBoundedImageOcrProviderConfig,
   parseBoundedImageOcrReceipt,
   requestBoundedImageOcr,
@@ -237,6 +239,7 @@ type ImageOcrLifecycleState =
   | 'reserved'
   | 'transport_attempted'
   | 'receipt_validated'
+  | 'invalid_provider_observation'
   | 'persisted'
   | 'failed';
 
@@ -247,12 +250,14 @@ export interface ImageOcrReservationLifecycle {
   readonly persistenceSucceeded: boolean;
   recordTransportAttempt(): void;
   recordProviderReceipt(receipt: BoundedImageOcrReceipt): void;
+  recordInvalidProviderObservation(observation: OcrInvalidProviderObservationAccounting): void;
   recordPersistenceSuccess(): void;
   recordFailure(stage: OcrFailureStage, outcome: OcrFailureOutcome): void;
 }
 
 function normalizeInjectedProviderReceipt(
   value: BoundedImageOcrReceipt,
+  limits: { maxInputTokens: number; reservedUsd: number },
 ): BoundedImageOcrReceipt {
   const validated = parseBoundedImageOcrReceipt({
     id: value?.requestId,
@@ -266,7 +271,7 @@ function normalizeInjectedProviderReceipt(
       cache_read_input_tokens: value?.cacheReadInputTokens,
       output_tokens: value?.outputTokens,
     },
-  });
+  }, limits);
   if (value.actualUsd !== validated.actualUsd) throw new BoundedImageOcrReceiptError();
   return validated;
 }
@@ -282,7 +287,15 @@ async function callConfirmedImageOcrProvider(
   receipt: BoundedImageOcrReceipt;
   expectedPageState: BoundedImageOcrExpectedPageState;
 }> {
-  await beforeProviderAttempt();
+  const reservation = await beforeProviderAttempt();
+  const expectedMaxInputTokens = entry.visual_tokens + IMAGE_OCR_NONVISUAL_INPUT_TOKEN_ALLOWANCE;
+  if (reservation.maxInputTokens !== expectedMaxInputTokens) {
+    throw new Error('Durable OCR reservation has the wrong request-specific input token ceiling');
+  }
+  const receiptLimits = {
+    maxInputTokens: reservation.maxInputTokens,
+    reservedUsd: reservation.reservedUsd,
+  };
 
   // Decode/build from a descriptor-bound post-reservation snapshot first. Any
   // async codec work completes before the final source/page re-read below.
@@ -362,9 +375,13 @@ async function callConfirmedImageOcrProvider(
       throw new Error('Image OCR provider transport failed');
     }
     try {
-      receipt = normalizeInjectedProviderReceipt(providerValue);
-    } catch {
-      lifecycle.recordFailure('provider_receipt', 'ambiguous');
+      receipt = normalizeInjectedProviderReceipt(providerValue, receiptLimits);
+    } catch (error) {
+      if (error instanceof BoundedImageOcrReceiptError && error.observation) {
+        lifecycle.recordInvalidProviderObservation(error.observation);
+      } else {
+        lifecycle.recordFailure('provider_receipt', 'ambiguous');
+      }
       throw new Error('Image OCR provider receipt was invalid');
     }
   } else {
@@ -373,14 +390,20 @@ async function callConfirmedImageOcrProvider(
         apiKey: providerConfig!.apiKey,
         providerBaseUrls: providerConfig!.providerBaseUrls,
         body: requestBody,
+        maxInputTokens: receiptLimits.maxInputTokens,
+        reservedUsd: receiptLimits.reservedUsd,
         onTransportAttempt: () => lifecycle.recordTransportAttempt(),
       });
     } catch (error) {
       if (lifecycle.state === 'transport_attempted') {
-        lifecycle.recordFailure(
-          error instanceof BoundedImageOcrReceiptError ? 'provider_receipt' : 'provider_transport',
-          'ambiguous',
-        );
+        if (error instanceof BoundedImageOcrReceiptError && error.observation) {
+          lifecycle.recordInvalidProviderObservation(error.observation);
+        } else {
+          lifecycle.recordFailure(
+            error instanceof BoundedImageOcrReceiptError ? 'provider_receipt' : 'provider_transport',
+            'ambiguous',
+          );
+        }
       }
       throw new Error('Image OCR provider call failed');
     }
@@ -467,8 +490,14 @@ async function executeConfirmedImageOcrRun(input: {
       },
       recordProviderReceipt(receiptValue) {
         if (lifecycleState !== 'transport_attempted') throw new Error('Invalid OCR lifecycle receipt transition');
-        const receipt = normalizeInjectedProviderReceipt(receiptValue);
         const active = activeReservation();
+        if (active.reservation.maxInputTokens === null) {
+          throw new Error('OCR reservation lacks a request-specific input token ceiling');
+        }
+        const receipt = normalizeInjectedProviderReceipt(receiptValue, {
+          maxInputTokens: active.reservation.maxInputTokens,
+          reservedUsd: active.reservation.reservedUsd,
+        });
         active.ledger.recordProviderReceipt(active.reservation, receipt);
         lifecycleState = 'receipt_validated';
         receiptValidated = true;
@@ -478,6 +507,19 @@ async function executeConfirmedImageOcrRun(input: {
         observedCacheReadInputTokens += receipt.cacheReadInputTokens;
         observedOutputTokens += receipt.outputTokens;
         observedUsdMicros += Math.round(receipt.actualUsd * 1_000_000);
+      },
+      recordInvalidProviderObservation(observation) {
+        if (lifecycleState !== 'transport_attempted') {
+          throw new Error('Invalid OCR lifecycle invalid-observation transition');
+        }
+        const active = activeReservation();
+        active.ledger.recordInvalidProviderObservation(active.reservation, observation);
+        lifecycleState = 'invalid_provider_observation';
+        observedInputTokens += observation.inputTokens;
+        observedCacheCreationInputTokens += observation.cacheCreationInputTokens;
+        observedCacheReadInputTokens += observation.cacheReadInputTokens;
+        observedOutputTokens += observation.outputTokens;
+        observedUsdMicros += Math.round(observation.actualUsd * 1_000_000);
       },
       recordPersistenceSuccess() {
         if (lifecycleState !== 'receipt_validated') throw new Error('Invalid OCR lifecycle persistence transition');
@@ -533,6 +575,7 @@ async function executeConfirmedImageOcrRun(input: {
               filePath: entry.file_path,
               registeredRoot: entry.registered_root,
               sha256: entry.sha256,
+              maxInputTokens: entry.visual_tokens + IMAGE_OCR_NONVISUAL_INPUT_TOKEN_ALLOWANCE,
             });
             reservation = madeReservation;
             reservationMade = true;
@@ -569,7 +612,12 @@ async function executeConfirmedImageOcrRun(input: {
       succeeded++;
     } catch (error) {
       runError = error;
-      if (reservationMade && lifecycle.state !== 'persisted' && lifecycle.state !== 'failed') {
+      if (
+        reservationMade
+        && lifecycle.state !== 'persisted'
+        && lifecycle.state !== 'failed'
+        && lifecycle.state !== 'invalid_provider_observation'
+      ) {
         const stage: OcrFailureStage = lifecycle.state === 'receipt_validated'
           ? 'persistence'
           : lifecycle.state === 'transport_attempted'
@@ -798,7 +846,9 @@ export async function runImageOcrRun(
             if (lifecycle.transportAttempted) await bumpOcrCounter(engine, 'ocr_provider_attempts');
             if (lifecycle.receiptValidated) await bumpOcrCounter(engine, 'ocr_successful_provider_receipts');
             if (lifecycle.persistenceSucceeded) await bumpOcrCounter(engine, 'ocr_persisted_imports');
-            if (lifecycle.state === 'failed') await bumpOcrCounter(engine, 'ocr_failures');
+            if (lifecycle.state === 'failed' || lifecycle.state === 'invalid_provider_observation') {
+              await bumpOcrCounter(engine, 'ocr_failures');
+            }
           }
         }),
     });

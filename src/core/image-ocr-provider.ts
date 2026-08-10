@@ -4,6 +4,8 @@ import { buildGatewayConfig } from './ai/build-gateway-config.ts';
 import {
   IMAGE_OCR_POLICY_MAX_OUTPUT_TOKENS,
   IMAGE_OCR_POLICY_MODEL,
+  type OcrInvalidProviderObservationAccounting,
+  type OcrProviderLimitViolation,
 } from './image-ocr-budget.ts';
 import { canonicalLookup } from './model-pricing.ts';
 export {
@@ -129,15 +131,26 @@ export interface BoundedImageOcrReceipt {
   actualUsd: number;
 }
 
+export interface BoundedImageOcrReceiptLimits {
+  maxInputTokens: number;
+  reservedUsd: number;
+}
+
 export class BoundedImageOcrReceiptError extends Error {
-  constructor() {
+  constructor(
+    readonly outcome: 'invalid' | 'over_limit' = 'invalid',
+    readonly observation: OcrInvalidProviderObservationAccounting | null = null,
+  ) {
     super('Bounded image OCR provider returned an invalid or ambiguous receipt');
     this.name = 'BoundedImageOcrReceiptError';
   }
 }
 
-function failReceipt(): never {
-  throw new BoundedImageOcrReceiptError();
+function failReceipt(
+  outcome: 'invalid' | 'over_limit' = 'invalid',
+  observation: OcrInvalidProviderObservationAccounting | null = null,
+): never {
+  throw new BoundedImageOcrReceiptError(outcome, observation);
 }
 
 function requiredUsageInteger(value: unknown): number {
@@ -145,8 +158,58 @@ function requiredUsageInteger(value: unknown): number {
   return value as number;
 }
 
+function validateReceiptLimits(limits: BoundedImageOcrReceiptLimits): void {
+  if (
+    !Number.isSafeInteger(limits.maxInputTokens)
+    || limits.maxInputTokens < 0
+    || !Number.isFinite(limits.reservedUsd)
+    || limits.reservedUsd < 0
+  ) failReceipt();
+}
+
+function actualUsdForUsage(inputTokens: number, outputTokens: number): number {
+  const pricing = canonicalLookup(IMAGE_OCR_POLICY_MODEL);
+  if (!pricing) failReceipt();
+  const actualUsd = (
+    inputTokens * pricing.input
+    + outputTokens * pricing.output
+  ) / 1_000_000;
+  if (!Number.isFinite(actualUsd) || actualUsd < 0) failReceipt();
+  return actualUsd;
+}
+
+function buildInvalidObservation(input: {
+  requestId: string;
+  model: string;
+  stopReason: string;
+  inputTokens: number;
+  cacheCreationInputTokens: number;
+  cacheReadInputTokens: number;
+  outputTokens: number;
+  actualUsd: number;
+  outcome: 'invalid' | 'over_limit';
+  limitViolations: readonly OcrProviderLimitViolation[];
+}): OcrInvalidProviderObservationAccounting {
+  return Object.freeze({
+    requestId: input.requestId,
+    model: input.model,
+    stopReason: input.stopReason,
+    inputTokens: input.inputTokens,
+    cacheCreationInputTokens: input.cacheCreationInputTokens,
+    cacheReadInputTokens: input.cacheReadInputTokens,
+    outputTokens: input.outputTokens,
+    actualUsd: input.actualUsd,
+    outcome: input.outcome,
+    limitViolations: Object.freeze([...input.limitViolations]),
+  });
+}
+
 /** Strictly validate the one response shape this paid lane can reconcile. */
-export function parseBoundedImageOcrReceipt(value: unknown): BoundedImageOcrReceipt {
+export function parseBoundedImageOcrReceipt(
+  value: unknown,
+  limits: BoundedImageOcrReceiptLimits,
+): BoundedImageOcrReceipt {
+  validateReceiptLimits(limits);
   if (!value || typeof value !== 'object' || Array.isArray(value)) failReceipt();
   const response = value as Record<string, unknown>;
   if (
@@ -177,13 +240,27 @@ export function parseBoundedImageOcrReceipt(value: unknown): BoundedImageOcrRece
   // would require tier-specific cache pricing that is absent from the pinned
   // request contract, so it is deliberately unreconcilable and fails closed.
   if (cacheCreationInputTokens !== 0 || cacheReadInputTokens !== 0) failReceipt();
-  const pricing = canonicalLookup(IMAGE_OCR_POLICY_MODEL);
-  if (!pricing) failReceipt();
-  const actualUsd = (
-    inputTokens * pricing.input
-    + outputTokens * pricing.output
-  ) / 1_000_000;
-  if (!Number.isFinite(actualUsd) || actualUsd < 0) failReceipt();
+  const actualUsd = actualUsdForUsage(inputTokens, outputTokens);
+  const limitViolations: OcrProviderLimitViolation[] = [];
+  if (inputTokens > limits.maxInputTokens) limitViolations.push('input_tokens');
+  if (outputTokens > IMAGE_OCR_POLICY_MAX_OUTPUT_TOKENS) limitViolations.push('output_tokens');
+  if (Math.round(actualUsd * 1_000_000) > Math.round(limits.reservedUsd * 1_000_000)) {
+    limitViolations.push('actual_usd');
+  }
+  if (limitViolations.length > 0) {
+    failReceipt('over_limit', buildInvalidObservation({
+      requestId: response.id.trim(),
+      model: IMAGE_OCR_POLICY_MODEL,
+      stopReason: 'end_turn',
+      inputTokens,
+      cacheCreationInputTokens,
+      cacheReadInputTokens,
+      outputTokens,
+      actualUsd,
+      outcome: 'over_limit',
+      limitViolations,
+    }));
+  }
 
   return Object.freeze({
     text: content.text.trim(),
@@ -207,6 +284,8 @@ type ImageOcrFetch = (
 export async function requestBoundedImageOcr(input: {
   apiKey: string;
   body: Buffer;
+  maxInputTokens: number;
+  reservedUsd: number;
   providerBaseUrls?: Record<string, string>;
   fetchImpl?: ImageOcrFetch;
   onTransportAttempt?: () => void;
@@ -240,5 +319,8 @@ export async function requestBoundedImageOcr(input: {
   } catch {
     failReceipt();
   }
-  return parseBoundedImageOcrReceipt(parsed);
+  return parseBoundedImageOcrReceipt(parsed, {
+    maxInputTokens: input.maxInputTokens,
+    reservedUsd: input.reservedUsd,
+  });
 }
