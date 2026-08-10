@@ -10,7 +10,7 @@ import { findChunkForOffset } from './chunkers/edge-extractor.ts';
 import { extractCodeRefs, imageOfCandidates } from './link-extraction.ts';
 import { embedBatch, embedMultimodal, currentEmbeddingSignature } from './embedding.ts';
 import { slugifyPath, slugifyCodePath, isCodeFilePath } from './sync.ts';
-import type { ChunkInput, PageInput, PageType } from './types.ts';
+import type { ChunkInput, Page, PageInput, PageType } from './types.ts';
 import { computeEffectiveDate } from './effective-date.ts';
 import { MARKDOWN_CHUNKER_VERSION } from './chunkers/recursive.ts';
 import { logSlugFallback } from './audit-slug-fallback.ts';
@@ -42,6 +42,10 @@ import { DEFAULT_SYNOPSIS_MODEL } from './page-summary.ts';
 import { runGuardrails } from './guardrails.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence } from './facts-fence.ts';
 import { buildBoundedImageOcrRequestBody } from './image-ocr-provider.ts';
+import {
+  prepareBoundedImageOcrBytes,
+  type BoundedImageOcrInfo,
+} from './image-ocr-image.ts';
 import {
   assertImageImportFenceToken,
   withImageImportFence,
@@ -1453,7 +1457,7 @@ export type ImportFileResult = ImportResult;
 export const SUPPORTED_IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.heic', '.heif', '.avif'] as const;
 
 /** Voyage caps each multimodal input at 20MB. We honor that as the size limit. */
-const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+export const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
 /** Extensions that need WASM decode before Voyage embedding. */
 const NEEDS_DECODE = new Set(['.heic', '.heif', '.avif']);
@@ -1477,8 +1481,75 @@ export interface ImportTransactionSpec {
   chunks?: ChunkInput[];
   /** Optional file-row insert (image ingest). Page link injected automatically. */
   file?: FileSpec;
+  /** Paid OCR only: exact page state captured immediately before transport. */
+  expectedPageState?: BoundedImageOcrExpectedPageState;
   /** Inside-transaction hook for type-specific work (tags, links). */
   after?: (tx: BrainEngine) => Promise<void>;
+}
+
+export class BoundedImageOcrPageStateConflictError extends Error {
+  constructor() {
+    super('Bounded image OCR target page changed during provider latency');
+    this.name = 'BoundedImageOcrPageStateConflictError';
+  }
+}
+
+async function lockBoundedImageOcrExpectedPageState(
+  tx: BrainEngine,
+  spec: ImportTransactionSpec,
+  sourceId: string,
+  expected: BoundedImageOcrExpectedPageState,
+): Promise<void> {
+  if (spec.hadExisting !== expected.exists) throw new BoundedImageOcrPageStateConflictError();
+  if (expected.exists) {
+    const rows = await tx.executeRaw<{ id: number }>(
+      `SELECT id
+       FROM pages
+       WHERE source_id = $1
+         AND slug = $2
+         AND id = $3
+         AND generation = $4::bigint
+         AND updated_at = $5::timestamptz
+         AND content_hash IS NOT DISTINCT FROM $6::text
+         AND deleted_at IS NOT DISTINCT FROM $7::timestamptz
+       FOR UPDATE`,
+      [
+        sourceId,
+        spec.slug,
+        expected.id,
+        expected.generation,
+        expected.updatedAt,
+        expected.contentHash,
+        expected.deletedAt,
+      ],
+    );
+    if (rows.length !== 1) throw new BoundedImageOcrPageStateConflictError();
+    return;
+  }
+
+  // Claim the previously-absent unique key inside this transaction. A writer
+  // that created the row while the provider was in flight makes RETURNING
+  // empty; a writer racing now blocks on this insert and can only write after
+  // the paid transaction has completed.
+  const rows = await tx.executeRaw<{ id: number }>(
+    `INSERT INTO pages
+       (source_id, slug, type, page_kind, title, compiled_truth, timeline, frontmatter, content_hash)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::text::jsonb, $9)
+     ON CONFLICT (source_id, slug) DO NOTHING
+     RETURNING id`,
+    [
+      sourceId,
+      spec.slug,
+      spec.page.type,
+      spec.page.page_kind ?? 'markdown',
+      spec.page.title,
+      spec.page.compiled_truth,
+      spec.page.timeline ?? '',
+      JSON.stringify(spec.page.frontmatter ?? {}),
+      spec.page.content_hash ?? null,
+    ],
+  );
+  if (rows.length !== 1) throw new BoundedImageOcrPageStateConflictError();
 }
 
 export async function withImportTransaction(
@@ -1488,6 +1559,9 @@ export async function withImportTransaction(
   const sourceId = spec.sourceId ?? 'default';
   const txOpts = spec.sourceId ? { sourceId: spec.sourceId } : undefined;
   await engine.transaction(async (tx) => {
+    if (spec.expectedPageState) {
+      await lockBoundedImageOcrExpectedPageState(tx, spec, sourceId, spec.expectedPageState);
+    }
     if (spec.hadExisting) await tx.createVersion(spec.slug, txOpts);
     await tx.putPage(spec.slug, spec.page, txOpts);
     if (spec.file) {
@@ -1610,7 +1684,8 @@ export async function prepareBoundedImageOcrInput(
   imageSlug: string,
   registeredRoot: string,
   expectedHash: string,
-): Promise<{ buf: Buffer; mime: string }> {
+  exactSourceBytes?: Buffer,
+): Promise<{ buf: Buffer; mime: string; info: BoundedImageOcrInfo }> {
   if (lstatSync(filePath).isSymbolicLink()) throw new Error('Bounded image OCR file may not be a symlink');
   if (!isAbsolute(registeredRoot) || resolve(registeredRoot) !== registeredRoot) {
     throw new Error('Bounded image OCR lacks a canonical registered source root');
@@ -1628,11 +1703,11 @@ export async function prepareBoundedImageOcrInput(
   if (statSync(filePath).size > MAX_IMAGE_BYTES) {
     throw new Error(`Bounded image OCR file exceeds ${MAX_IMAGE_BYTES} bytes`);
   }
-  const buf = readFileSync(filePath);
+  const buf = exactSourceBytes ?? readFileSync(filePath);
   if (createHash('sha256').update(buf).digest('hex') !== expectedHash) {
     throw new Error('Bounded image OCR file hash changed after manifest validation');
   }
-  const prepared = await decodeIfNeeded(extname(filePath).toLowerCase(), buf);
+  const prepared = await prepareBoundedImageOcrBytes(buf, extname(filePath).toLowerCase());
   // Build and measure the exact UTF-8 JSON wire body during full-manifest
   // preflight. The provider boundary rebuilds and checks it again after the
   // final file/hash revalidation.
@@ -1693,8 +1768,50 @@ export interface ImportImageOptions {
   imageImportFenceRoot?: string;
 }
 
+export type BoundedImageOcrExpectedPageState =
+  | { readonly exists: false }
+  | {
+    readonly exists: true;
+    readonly id: number;
+    readonly generation: number;
+    readonly contentHash: string | null;
+    readonly updatedAt: string;
+    readonly deletedAt: string | null;
+  };
+
+/** Freeze the exact content-write token observed immediately before transport. */
+export function captureBoundedImageOcrExpectedPageState(
+  page: Page | null,
+): BoundedImageOcrExpectedPageState {
+  if (!page) return Object.freeze({ exists: false as const });
+  if (
+    !Number.isSafeInteger(page.id) || page.id <= 0
+    || !Number.isSafeInteger(page.generation) || (page.generation ?? 0) <= 0
+    || !(page.updated_at instanceof Date) || !Number.isFinite(page.updated_at.getTime())
+    || !(page.deleted_at == null || (
+      page.deleted_at instanceof Date && Number.isFinite(page.deleted_at.getTime())
+    ))
+    || !(page.content_hash == null || typeof page.content_hash === 'string')
+  ) {
+    throw new Error('Bounded image OCR cannot freeze an exact pre-call page state');
+  }
+  return Object.freeze({
+    exists: true as const,
+    id: page.id,
+    generation: page.generation as number,
+    contentHash: page.content_hash ?? null,
+    updatedAt: page.updated_at.toISOString(),
+    deletedAt: page.deleted_at?.toISOString() ?? null,
+  });
+}
+
 interface InternalImportImageOptions extends ImportImageOptions {
-  boundedOcr?: { text: string; expectedHash: string; registeredRoot: string };
+  boundedOcr?: {
+    text: string;
+    expectedHash: string;
+    registeredRoot: string;
+    expectedPageState: BoundedImageOcrExpectedPageState;
+  };
   imageImportFenceToken: ImageImportFenceToken;
 }
 
@@ -1733,6 +1850,7 @@ export async function importImageFileWithBoundedOcrText(
   registeredRoot: string,
   expectedHash: string,
   ocrText: string,
+  expectedPageState: BoundedImageOcrExpectedPageState,
   imageImportFenceToken: ImageImportFenceToken,
 ): Promise<ImportResult> {
   if (ocrText.trim().length === 0) throw new Error('Bounded image OCR text is empty');
@@ -1740,7 +1858,7 @@ export async function importImageFileWithBoundedOcrText(
   return importImageFileInternal(engine, filePath, relativePath, {
     sourceId,
     noEmbed: true,
-    boundedOcr: { text: ocrText, expectedHash, registeredRoot },
+    boundedOcr: { text: ocrText, expectedHash, registeredRoot, expectedPageState },
     imageImportFenceToken,
   });
 }
@@ -1879,7 +1997,7 @@ async function importImageFileInternal(
 
   await withImportTransaction(engine, {
     slug: imageSlug,
-    hadExisting: !!existing,
+    hadExisting: opts.boundedOcr ? opts.boundedOcr.expectedPageState.exists : !!existing,
     sourceId: opts.sourceId,
     page: {
       type: 'image',
@@ -1892,6 +2010,7 @@ async function importImageFileInternal(
     },
     chunks: [chunk],
     file: fileSpec,
+    expectedPageState: opts.boundedOcr?.expectedPageState,
     after: async (tx) => {
       // Cherry-3: path-proximity auto-link to a sibling text page. The first
       // matching candidate gets an image_of edge. Best-effort — addLink

@@ -3,10 +3,11 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   symlinkSync,
-  unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -14,6 +15,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { BrainEngine } from '../src/core/engine.ts';
+import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
   IMAGE_OCR_POLICY_MAX_OUTPUT_TOKENS,
   IMAGE_OCR_POLICY_MODEL,
@@ -46,18 +48,93 @@ import {
   IMAGE_OCR_OUTPUT_USD_PER_MTOK,
   buildBoundedImageOcrRequestBody,
   requestBoundedImageOcr,
+  type BoundedImageOcrReceipt,
 } from '../src/core/image-ocr-provider.ts';
 import { withEnv } from './helpers/with-env.ts';
 
 const UTC_DAY_1 = new Date('2026-08-10T23:59:59.000Z');
 const UTC_DAY_2 = new Date('2026-08-11T00:00:00.000Z');
+const TINY_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+  'base64',
+);
+const TINY_JPEG = Buffer.from(
+  '/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYyLjI4LjEwMgD/2wBDAAgEBAQEBAUFBQUFBQYGBgYGBgYGBgYGBgYHBwcICAgHBwcGBgcHCAgICAkJCQgICAgJCQoKCgwMCwsODg4RERT/xABLAAEBAAAAAAAAAAAAAAAAAAAABwEBAAAAAAAAAAAAAAAAAAAAABABAAAAAAAAAAAAAAAAAAAAABEBAAAAAAAAAAAAAAAAAAAAAP/AABEIAAIAAgMBIgACEQADEQD/2gAMAwEAAhEDEQA/AL+AD//Z',
+  'base64',
+);
+const TINY_GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==', 'base64');
+const TINY_WEBP = Buffer.from('UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoCAAIAAgA0JaQAA3AA/vtdAAA=', 'base64');
+
+function anthropicMessageResponse(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 'msg_injected_123',
+    type: 'message',
+    model: IMAGE_OCR_POLICY_MODEL,
+    stop_reason: 'end_turn',
+    content: [{ type: 'text', text: 'verbatim text' }],
+    usage: {
+      input_tokens: 100,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      output_tokens: 10,
+    },
+    ...overrides,
+  };
+}
+
+function injectedReceipt(text = 'verbatim text'): BoundedImageOcrReceipt {
+  return {
+    text,
+    model: IMAGE_OCR_POLICY_MODEL,
+    stopReason: 'end_turn',
+    requestId: 'msg_injected_123',
+    inputTokens: 100,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
+    outputTokens: 10,
+    actualUsd: 0.00015,
+  };
+}
 
 function sha256(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
+function pngCrc32(bytes: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngWithDimensions(width: number, height: number): Buffer {
+  const bytes = Buffer.from(TINY_PNG);
+  bytes.writeUInt32BE(width, 16);
+  bytes.writeUInt32BE(height, 20);
+  bytes.writeUInt32BE(pngCrc32(bytes.subarray(12, 29)), 29);
+  return bytes;
+}
+
+function animatedGif(): Buffer {
+  const trailer = TINY_GIF.length - 1;
+  const imageStart = TINY_GIF.indexOf(0x2c);
+  return Buffer.concat([
+    TINY_GIF.subarray(0, trailer),
+    TINY_GIF.subarray(imageStart, trailer),
+    TINY_GIF.subarray(trailer),
+  ]);
+}
+
 function reservationFields(filePath = '/tmp/image.png', hash = 'a'.repeat(64), registeredRoot = dirname(filePath)) {
   return { filePath, registeredRoot, sha256: hash };
+}
+
+async function waitForFile(path: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path) && Date.now() < deadline) await Bun.sleep(10);
+  if (!existsSync(path)) throw new Error(`Timed out waiting for ${path}`);
 }
 
 function fixture(count = 1) {
@@ -68,7 +145,7 @@ function fixture(count = 1) {
     const rel = `images/${String(i).padStart(4, '0')}.png`;
     const filePath = join(root, rel);
     mkdirSync(join(root, 'images'), { recursive: true });
-    const bytes = Buffer.from(`png-${i}`);
+    const bytes = Buffer.from(TINY_PNG);
     writeFileSync(filePath, bytes);
     lines.push(JSON.stringify({
       source_id: 'source-a',
@@ -92,6 +169,24 @@ function fixture(count = 1) {
   return { root, ledgerDir, manifestPath, engine };
 }
 
+function replaceFixtureImage(
+  f: ReturnType<typeof fixture>,
+  bytes: Buffer,
+  extension = '.png',
+): { file_path: string; sha256: string; slug: string; source_id: string } {
+  const slug = `images/0000${extension}`;
+  const filePath = join(f.root, slug);
+  writeFileSync(filePath, bytes);
+  const entry = {
+    source_id: 'source-a',
+    slug,
+    file_path: filePath,
+    sha256: sha256(bytes),
+  };
+  writeFileSync(f.manifestPath, `${JSON.stringify(entry)}\n`);
+  return entry;
+}
+
 function statefulImageEngine(root: string) {
   let registeredRoot = root;
   let syntheticPageDrift = false;
@@ -113,6 +208,25 @@ function statefulImageEngine(root: string) {
     getConfig: async () => '0',
     setConfig: async () => {},
     transaction: async (fn: (tx: BrainEngine) => Promise<unknown>) => fn(engine as unknown as BrainEngine),
+    executeRaw: async (sql: string, params: unknown[] = []) => {
+      if (/INSERT INTO pages[\s\S]*ON CONFLICT \(source_id, slug\) DO NOTHING/.test(sql)) {
+        return pages.has(String(params[1])) ? [] : [{ id: -1 }];
+      }
+      if (/FROM pages[\s\S]*FOR UPDATE/.test(sql)) {
+        const current = pages.get(String(params[1]));
+        if (!current) return [];
+        const updatedAt = current.updated_at instanceof Date ? current.updated_at.toISOString() : null;
+        const deletedAt = current.deleted_at instanceof Date ? current.deleted_at.toISOString() : null;
+        return current.id === params[2]
+          && current.generation === params[3]
+          && updatedAt === params[4]
+          && (current.content_hash ?? null) === params[5]
+          && deletedAt === params[6]
+          ? [{ id: current.id }]
+          : [];
+      }
+      throw new Error('Unexpected statefulImageEngine raw SQL');
+    },
     createVersion: async () => {},
     putPage: async (slug: string, page: Record<string, unknown>) => {
       pages.set(slug, { id: `page-${nextId++}`, ...page });
@@ -169,9 +283,17 @@ type TestImportEntry = NonNullable<NonNullable<Parameters<typeof runImageOcrRun>
 function reservedImport(
   run: (entry: Parameters<TestImportEntry>[0]) => void | Promise<void>,
 ): TestImportEntry {
-  return async (entry, beforeProviderAttempt) => {
+  return async (entry, beforeProviderAttempt, _fenceToken, lifecycle) => {
     await beforeProviderAttempt();
-    await run(entry);
+    lifecycle.recordTransportAttempt();
+    try {
+      await run(entry);
+      lifecycle.recordProviderReceipt(injectedReceipt());
+      lifecycle.recordPersistenceSuccess();
+    } catch (error) {
+      lifecycle.recordFailure('provider_transport', 'ambiguous');
+      throw error;
+    }
   };
 }
 
@@ -208,8 +330,28 @@ describe('bounded OCR authorization', () => {
     const report = await runCommand(f, undefined, {
       ocrProvider: async () => { throw new Error('provider body'); },
     });
-    expect(report?.status).toBe('failed');
+    expect(report).toMatchObject({
+      status: 'failed',
+      reservations: 1,
+      provider_attempts: 1,
+      successful_provider_receipts: 0,
+      observed_input_tokens: 0,
+      observed_cache_creation_input_tokens: 0,
+      observed_cache_read_input_tokens: 0,
+      observed_output_tokens: 0,
+      observed_usd: 0,
+      persisted_imports: 0,
+      failures: 1,
+    });
     expect(writes).toEqual([]);
+    expect(JSON.parse(readFileSync(join(f.ledgerDir, '2026-08-10.json'), 'utf8')).audit[0]).toMatchObject({
+      state: 'failed',
+      transport_attempted: true,
+      provider_receipt: null,
+      persistence_succeeded: false,
+      outcome: 'ambiguous',
+      failure_stage: 'provider_transport',
+    });
   });
 
   test('empty OCR output is a strict failure and never becomes a filename stub', async () => {
@@ -219,7 +361,7 @@ describe('bounded OCR authorization', () => {
       getConfig: async () => '0',
       setConfig: async () => {},
     } as unknown as BrainEngine;
-    const report = await runCommand(f, undefined, { ocrProvider: async () => '   ' });
+    const report = await runCommand(f, undefined, { ocrProvider: async () => injectedReceipt('   ') });
     expect(report?.status).toBe('failed');
     expect(report?.succeeded).toBe(0);
   });
@@ -305,6 +447,118 @@ describe('manifest preflight', () => {
         code: 'manifest_invalid',
       },
     });
+  });
+
+  test('rejects a symlinked registered source root before reservation or transport', async () => {
+    const f = fixture();
+    const linkedRoot = join(dirname(f.root), `${f.root.split('/').at(-1)}-link`);
+    symlinkSync(f.root, linkedRoot, 'dir');
+    const entry = JSON.parse(readFileSync(f.manifestPath, 'utf8').trim());
+    entry.file_path = join(linkedRoot, 'images/0000.png');
+    writeFileSync(f.manifestPath, `${JSON.stringify(entry)}\n`);
+    let providerCalls = 0;
+    f.engine = {
+      ...f.engine,
+      listAllSources: async () => [{
+        id: 'source-a', name: 'Source A', local_path: linkedRoot, last_sync_at: null, config: {},
+      }],
+      getConfig: async () => '0',
+      setConfig: async () => {},
+    } as unknown as BrainEngine;
+
+    const report = await runCommand(f, undefined, {
+      ocrProvider: async () => { providerCalls++; return injectedReceipt('text'); },
+    });
+    expect(providerCalls).toBe(0);
+    expect(report).toMatchObject({ status: 'rejected', processed: 0, terminal_error: 'manifest_invalid' });
+  });
+
+  test('malformed and zero-byte images are rejected before reservation or transport', async () => {
+    for (const bytes of [Buffer.alloc(0), Buffer.from('not a png')]) {
+      const f = fixture();
+      replaceFixtureImage(f, bytes);
+      let providerCalls = 0;
+      const report = await runCommand(f, undefined, {
+        ocrProvider: async () => { providerCalls++; return injectedReceipt('text'); },
+      });
+      expect(providerCalls).toBe(0);
+      expect(report).toMatchObject({ status: 'rejected', processed: 0, terminal_error: 'manifest_invalid' });
+    }
+  });
+
+  test('animated or multiframe content is rejected before reservation or transport', async () => {
+    const f = fixture();
+    replaceFixtureImage(f, animatedGif(), '.gif');
+    let providerCalls = 0;
+    const report = await runCommand(f, undefined, {
+      ocrProvider: async () => { providerCalls++; return injectedReceipt('text'); },
+    });
+    expect(providerCalls).toBe(0);
+    expect(report).toMatchObject({ status: 'rejected', processed: 0, terminal_error: 'manifest_invalid' });
+  });
+
+  test('provider-dimension and decoded-pixel bombs are rejected before decode or transport', async () => {
+    for (const bytes of [pngWithDimensions(8_001, 1), pngWithDimensions(5_001, 5_000)]) {
+      const f = fixture();
+      replaceFixtureImage(f, bytes);
+      let providerCalls = 0;
+      const report = await runCommand(f, undefined, {
+        ocrProvider: async () => { providerCalls++; return injectedReceipt('text'); },
+      });
+      expect(providerCalls).toBe(0);
+      expect(report).toMatchObject({ status: 'rejected', processed: 0, terminal_error: 'manifest_invalid' });
+    }
+  });
+
+  test('all allowed codecs have validated single-frame dimensions before wire preparation', async () => {
+    const { prepareBoundedImageOcrBytes } = await import('../src/core/image-ocr-image.ts');
+    const codecs = [
+      { extension: '.png', bytes: TINY_PNG, format: 'png', width: 1, height: 1 },
+      { extension: '.jpg', bytes: TINY_JPEG, format: 'jpeg', width: 2, height: 2 },
+      { extension: '.gif', bytes: TINY_GIF, format: 'gif', width: 1, height: 1 },
+      { extension: '.webp', bytes: TINY_WEBP, format: 'webp', width: 2, height: 2 },
+      { extension: '.heic', bytes: readFileSync('test/fixtures/images/tiny.heic'), format: 'heic', width: 356, height: 356 },
+      { extension: '.heif', bytes: readFileSync('test/fixtures/images/tiny.heic'), format: 'heic', width: 356, height: 356 },
+      { extension: '.avif', bytes: readFileSync('test/fixtures/images/tiny.avif'), format: 'avif', width: 8, height: 8 },
+    ];
+    for (const codec of codecs) {
+      const prepared = await prepareBoundedImageOcrBytes(codec.bytes, codec.extension);
+      expect(prepared.info).toMatchObject({
+        format: codec.format,
+        width: codec.width,
+        height: codec.height,
+        frameCount: 1,
+      });
+      expect(prepared.info.visualTokens).toBeGreaterThan(0);
+      expect(prepared.info.worstCaseUsd).toBeLessThanOrEqual(0.01);
+      expect(prepared.buf.length).toBeGreaterThan(0);
+    }
+  });
+
+  test('dimension, pixel, token, and cost enforcement is exact at every boundary', async () => {
+    const {
+      IMAGE_OCR_LOCAL_MAX_PIXELS,
+      IMAGE_OCR_PROVIDER_MAX_DIMENSION,
+      validateAndPriceImageOcrDimensions,
+    } = await import('../src/core/image-ocr-image.ts');
+    expect(IMAGE_OCR_PROVIDER_MAX_DIMENSION).toBe(8_000);
+    expect(IMAGE_OCR_LOCAL_MAX_PIXELS).toBe(25_000_000);
+    expect(validateAndPriceImageOcrDimensions(8_000, 1)).toMatchObject({ width: 8_000, height: 1 });
+    expect(validateAndPriceImageOcrDimensions(750, 1)).toMatchObject({
+      visualTokens: 1,
+      worstCaseUsd: 0.005621,
+    });
+    expect(validateAndPriceImageOcrDimensions(751, 1)).toMatchObject({
+      visualTokens: 2,
+      worstCaseUsd: 0.005622,
+    });
+    const pixelBoundary = validateAndPriceImageOcrDimensions(5_000, 5_000);
+    expect(pixelBoundary.pixels).toBe(25_000_000);
+    expect(pixelBoundary.visualTokens).toBeLessThanOrEqual(1_568);
+    expect(pixelBoundary.worstCaseUsd).toBeLessThanOrEqual(0.01);
+    expect(() => validateAndPriceImageOcrDimensions(8_001, 1)).toThrow(/dimension/i);
+    expect(() => validateAndPriceImageOcrDimensions(5_001, 5_000)).toThrow(/pixel/i);
+    expect(() => validateAndPriceImageOcrDimensions(0, 1)).toThrow(/dimension/i);
   });
 });
 
@@ -457,7 +711,7 @@ describe('persistent daily ledger', () => {
       afterReserve: (_entry, reservation) => { reservationDates.push(reservation.utcDate); },
       ocrProvider: async () => {
         providerDates.push(logicalNow.toISOString().slice(0, 10));
-        return 'post-fence OCR';
+        return injectedReceipt('post-fence OCR');
       },
     });
 
@@ -649,6 +903,27 @@ describe('persistent daily ledger', () => {
       .toThrow(/ambiguous/);
   });
 
+  test('an internally inconsistent provider receipt makes the audit ambiguous', () => {
+    const f = fixture();
+    const caps = validateImageOcrCaps({ maxImages: 2, maxUsd: 1, reserveUsdPerCall: 0.01 });
+    const first = OcrBudgetLedger.acquire({ directory: f.ledgerDir, now: UTC_DAY_1, caps, manifestHash: 'a'.repeat(64) });
+    const reservation = first.reserve({
+      index: 0,
+      sourceId: 'source-a',
+      slug: 'images/a.png',
+      ...reservationFields('/tmp/a.png'),
+    });
+    first.recordTransportAttempt(reservation);
+    first.recordProviderReceipt(reservation, injectedReceipt());
+    first.close();
+    const ledgerPath = join(f.ledgerDir, '2026-08-10.json');
+    const corrupt = JSON.parse(readFileSync(ledgerPath, 'utf8'));
+    corrupt.audit[0].provider_receipt.model = 'unexpected-model';
+    writeFileSync(ledgerPath, `${JSON.stringify(corrupt)}\n`);
+    expect(() => OcrBudgetLedger.acquire({ directory: f.ledgerDir, now: UTC_DAY_1, caps, manifestHash: 'b'.repeat(64) }))
+      .toThrow(/ambiguous/);
+  });
+
   test('an existing or ambiguous lock fails closed and is never broken', () => {
     const f = fixture();
     const caps = validateImageOcrCaps({ maxImages: 1, maxUsd: 1, reserveUsdPerCall: 0.01 });
@@ -680,6 +955,113 @@ describe('persistent daily ledger', () => {
       .toThrow(OcrBudgetLockError);
     child.kill();
     await child.exited;
+  });
+
+  test('a replaced budget lock cannot be unlinked by its old owner or admit two reservations', async () => {
+    const f = fixture();
+    const lockPath = join(f.ledgerDir, '2026-08-10.lock');
+    const aReady = join(f.ledgerDir, 'a-ready');
+    const aClose = join(f.ledgerDir, 'a-close');
+    const aClosed = join(f.ledgerDir, 'a-closed');
+    const bReady = join(f.ledgerDir, 'b-ready');
+    const bReserve = join(f.ledgerDir, 'b-reserve');
+    const bReserved = join(f.ledgerDir, 'b-reserved');
+    const bClose = join(f.ledgerDir, 'b-close');
+
+    const ownerCode = (name: 'a' | 'b') => `
+      import { existsSync, writeFileSync } from 'node:fs';
+      import { OcrBudgetLedger } from './src/core/image-ocr-budget.ts';
+      const ledger = OcrBudgetLedger.acquire({
+        directory: ${JSON.stringify(f.ledgerDir)},
+        now: new Date('2026-08-10T23:59:59.000Z'),
+        caps: { maxImages: 1, maxUsd: 0.01, reserveUsdPerCall: 0.01 },
+        manifestHash: '${name}'.repeat(64),
+      });
+      writeFileSync(${JSON.stringify(name === 'a' ? aReady : bReady)}, 'ready');
+      ${name === 'b' ? `
+        while (!existsSync(${JSON.stringify(bReserve)})) await Bun.sleep(10);
+        ledger.reserve({
+          index: 0,
+          sourceId: 'source-a',
+          slug: 'images/b.png',
+          filePath: '/tmp/b.png',
+          registeredRoot: '/tmp',
+          sha256: 'b'.repeat(64),
+        });
+        writeFileSync(${JSON.stringify(bReserved)}, 'reserved');
+      ` : ''}
+      while (!existsSync(${JSON.stringify(name === 'a' ? aClose : bClose)})) await Bun.sleep(10);
+      try { ledger.close(); } catch {}
+      ${name === 'a' ? `writeFileSync(${JSON.stringify(aClosed)}, 'closed');` : ''}
+    `;
+
+    const ownerA = Bun.spawn(['bun', '-e', ownerCode('a')], {
+      cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe',
+    });
+    await waitForFile(aReady);
+    const [ownerMetadataFile] = readdirSync(lockPath);
+    expect(JSON.parse(readFileSync(join(lockPath, ownerMetadataFile), 'utf8'))).toMatchObject({
+      pid: expect.any(Number),
+      process_started_at_ms: expect.any(Number),
+      hostname: expect.any(String),
+      owner_token: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+
+    // Simulate an operator incorrectly removing a lock believed to be stale,
+    // then let a new process create a replacement at the same pathname.
+    rmSync(lockPath, { recursive: true });
+    const ownerB = Bun.spawn(['bun', '-e', ownerCode('b')], {
+      cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe',
+    });
+    await waitForFile(bReady);
+
+    writeFileSync(aClose, 'close');
+    await waitForFile(aClosed);
+
+    const ownerCCode = `
+      import { OcrBudgetLedger, OcrBudgetLockError } from './src/core/image-ocr-budget.ts';
+      try {
+        const ledger = OcrBudgetLedger.acquire({
+          directory: ${JSON.stringify(f.ledgerDir)},
+          now: new Date('2026-08-10T23:59:59.000Z'),
+          caps: { maxImages: 1, maxUsd: 0.01, reserveUsdPerCall: 0.01 },
+          manifestHash: 'c'.repeat(64),
+        });
+        ledger.reserve({
+          index: 0,
+          sourceId: 'source-a',
+          slug: 'images/c.png',
+          filePath: '/tmp/c.png',
+          registeredRoot: '/tmp',
+          sha256: 'c'.repeat(64),
+        });
+        process.stdout.write('RESERVED\\n');
+        ledger.close();
+      } catch (error) {
+        process.stdout.write(error instanceof OcrBudgetLockError ? 'LOCKED\\n' : 'ERROR\\n');
+      }
+    `;
+    const ownerC = Bun.spawn(['bun', '-e', ownerCCode], {
+      cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe',
+    });
+    const [ownerCOutput, ownerCExit] = await Promise.all([
+      new Response(ownerC.stdout).text(),
+      ownerC.exited,
+    ]);
+
+    writeFileSync(bReserve, 'reserve');
+    await waitForFile(bReserved);
+    writeFileSync(bClose, 'close');
+    const [ownerAExit, ownerBExit] = await Promise.all([ownerA.exited, ownerB.exited]);
+
+    expect(ownerAExit).toBe(0);
+    expect(ownerBExit).toBe(0);
+    expect(ownerCExit).toBe(0);
+    expect(ownerCOutput.trim()).toBe('LOCKED');
+    expect(JSON.parse(readFileSync(join(f.ledgerDir, '2026-08-10.json'), 'utf8'))).toMatchObject({
+      calls_reserved: 1,
+      audit: [{ slug: 'images/b.png' }],
+    });
   });
 });
 
@@ -716,19 +1098,22 @@ describe('bounded run behavior', () => {
   test('serializes one exact canonical Anthropic request and performs one fetch with no retry', async () => {
     const body = buildBoundedImageOcrRequestBody(Buffer.from('image-bytes'), 'image/png');
     const calls: Array<{ url: string; init: RequestInit }> = [];
-    const text = await requestBoundedImageOcr({
+    let transportAttempts = 0;
+    const receipt = await requestBoundedImageOcr({
       apiKey: 'test-key',
       body,
+      onTransportAttempt: () => { transportAttempts++; },
       fetchImpl: async (url, init) => {
         calls.push({ url: String(url), init: init ?? {} });
-        return new Response(JSON.stringify({ content: [{ type: 'text', text: 'verbatim text' }] }), {
+        return new Response(JSON.stringify(anthropicMessageResponse()), {
           status: 200,
           headers: { 'content-type': 'application/json' },
         });
       },
     });
 
-    expect(text).toBe('verbatim text');
+    expect(receipt).toEqual(injectedReceipt());
+    expect(transportAttempts).toBe(1);
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe(BOUNDED_IMAGE_OCR_ENDPOINT);
     expect(calls[0].init).toEqual({
@@ -754,6 +1139,52 @@ describe('bounded run behavior', () => {
         ],
       }],
     });
+  });
+
+  test('rejects unexpected, truncated, ambiguous, or unbillable provider receipts', async () => {
+    const body = buildBoundedImageOcrRequestBody(Buffer.from('image-bytes'), 'image/png');
+    const invalidResponses = [
+      anthropicMessageResponse({ type: 'error' }),
+      anthropicMessageResponse({ model: 'claude-other-model' }),
+      anthropicMessageResponse({ stop_reason: 'max_tokens' }),
+      anthropicMessageResponse({ stop_reason: null }),
+      anthropicMessageResponse({ id: '' }),
+      anthropicMessageResponse({ content: [
+        { type: 'text', text: 'first' },
+        { type: 'text', text: 'second' },
+      ] }),
+      anthropicMessageResponse({ content: [{ type: 'text', text: '   ' }] }),
+      anthropicMessageResponse({ usage: undefined }),
+      anthropicMessageResponse({ usage: {
+        input_tokens: -1,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        output_tokens: 1,
+      } }),
+      anthropicMessageResponse({ usage: {
+        input_tokens: 1.5,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        output_tokens: 1,
+      } }),
+      anthropicMessageResponse({ usage: {
+        input_tokens: 1,
+        cache_creation_input_tokens: 1,
+        cache_read_input_tokens: 0,
+        output_tokens: 1,
+      } }),
+    ];
+
+    for (const responseBody of invalidResponses) {
+      await expect(requestBoundedImageOcr({
+        apiKey: 'test-key',
+        body,
+        fetchImpl: async () => new Response(JSON.stringify(responseBody), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      })).rejects.toThrow();
+    }
   });
 
   test('native fetch rejects redirects without sending the OCR request to the redirect target', async () => {
@@ -958,7 +1389,7 @@ describe('bounded run behavior', () => {
     ledger.close();
   });
 
-  test('post-reservation file mutation cannot alter the already validated provider bytes', async () => {
+  test('post-reservation file mutation consumes the reservation and makes zero transport attempts', async () => {
     const f = fixture();
     let providerCalls = 0;
     let providerBytes = '';
@@ -974,12 +1405,111 @@ describe('bounded run behavior', () => {
       ocrProvider: async (bytes) => {
         providerCalls++;
         providerBytes = bytes.toString('utf8');
-        return 'text';
+        return injectedReceipt('text');
       },
     });
-    expect(providerCalls).toBe(1);
-    expect(providerBytes).toBe('png-0');
-    expect(report?.status).toBe('failed');
+    expect(providerCalls).toBe(0);
+    expect(providerBytes).toBe('');
+    expect(report).toMatchObject({ status: 'failed', processed: 1, succeeded: 0, failed: 1 });
+  });
+
+  test('post-reservation registered-root replacement consumes the reservation and makes zero transport attempts', async () => {
+    const f = fixture();
+    let providerCalls = 0;
+    f.engine = {
+      ...f.engine,
+      getPage: async () => null,
+      getConfig: async () => '0',
+      setConfig: async () => {},
+    } as unknown as BrainEngine;
+    const report = await runCommand(f, undefined, {
+      afterReserve: (entry) => {
+        const movedRoot = `${f.root}-moved`;
+        renameSync(f.root, movedRoot);
+        mkdirSync(join(f.root, 'images'), { recursive: true });
+        writeFileSync(entry.file_path, readFileSync(join(movedRoot, 'images/0000.png')));
+      },
+      ocrProvider: async () => { providerCalls++; return injectedReceipt('text'); },
+    });
+    expect(providerCalls).toBe(0);
+    expect(report).toMatchObject({ status: 'failed', processed: 1, succeeded: 0, failed: 1 });
+  });
+
+  test('reconciles a valid provider receipt through durable persistence', async () => {
+    const f = fixture();
+    const state = statefulImageEngine(f.root);
+    f.engine = state.engine;
+
+    const report = await runCommand(f, undefined, {
+      ocrProvider: async () => injectedReceipt('PAID OCR RESULT'),
+    });
+
+    expect(report).toMatchObject({
+      status: 'completed',
+      reservations: 1,
+      provider_attempts: 1,
+      successful_provider_receipts: 1,
+      observed_input_tokens: 100,
+      observed_cache_creation_input_tokens: 0,
+      observed_cache_read_input_tokens: 0,
+      observed_output_tokens: 10,
+      observed_usd: 0.00015,
+      persisted_imports: 1,
+      failures: 0,
+    });
+    const audit = JSON.parse(readFileSync(join(f.ledgerDir, '2026-08-10.json'), 'utf8')).audit[0];
+    expect(audit).toMatchObject({
+      state: 'persisted',
+      transport_attempted: true,
+      persistence_succeeded: true,
+      outcome: 'persisted',
+      failure_stage: null,
+      provider_receipt: {
+        request_id: 'msg_injected_123',
+        model: IMAGE_OCR_POLICY_MODEL,
+        stop_reason: 'end_turn',
+        input_tokens: 100,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        output_tokens: 10,
+        actual_usd_micros: 150,
+      },
+    });
+  });
+
+  test('keeps a valid paid receipt but records persistence failure without importing text', async () => {
+    const f = fixture();
+    const state = statefulImageEngine(f.root);
+    f.engine = {
+      ...state.engine,
+      transaction: async () => { throw new Error('injected persistence failure'); },
+    } as unknown as BrainEngine;
+
+    const report = await runCommand(f, undefined, {
+      ocrProvider: async () => injectedReceipt('MUST NOT PERSIST'),
+    });
+
+    expect(report).toMatchObject({
+      status: 'failed',
+      reservations: 1,
+      provider_attempts: 1,
+      successful_provider_receipts: 1,
+      observed_input_tokens: 100,
+      observed_output_tokens: 10,
+      observed_usd: 0.00015,
+      persisted_imports: 0,
+      failures: 1,
+    });
+    expect(state.pages.size).toBe(0);
+    expect(state.chunks.size).toBe(0);
+    expect(JSON.parse(readFileSync(join(f.ledgerDir, '2026-08-10.json'), 'utf8')).audit[0]).toMatchObject({
+      state: 'failed',
+      transport_attempted: true,
+      persistence_succeeded: false,
+      outcome: 'failed',
+      failure_stage: 'persistence',
+      provider_receipt: { request_id: 'msg_injected_123', actual_usd_micros: 150 },
+    });
   });
 
   test('routine image import waits behind the paid attempt through OCR persistence', async () => {
@@ -999,7 +1529,7 @@ describe('bounded run behavior', () => {
       ocrProvider: async () => {
         signalProviderStarted();
         await providerRelease;
-        return 'PAID OCR RESULT';
+        return injectedReceipt('PAID OCR RESULT');
       },
     });
     await providerStarted;
@@ -1020,6 +1550,66 @@ describe('bounded run behavior', () => {
     expect(await bounded).toMatchObject({ status: 'completed', succeeded: 1 });
     expect(await routine).toMatchObject({ status: 'skipped' });
     expect(state.chunks.get(entry.slug)?.[0]?.chunk_text).toBe('PAID OCR RESULT');
+  });
+
+  test('a generic page writer during provider latency wins the persistence compare-and-set', async () => {
+    const f = fixture();
+    const engine = new PGLiteEngine();
+    await engine.connect({ type: 'pglite' } as never);
+    await engine.initSchema();
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path) VALUES ($1, $2, $3)`,
+      ['source-a', 'Source A', f.root],
+    );
+    f.engine = engine;
+    const entry = JSON.parse(readFileSync(f.manifestPath, 'utf8').trim()) as { slug: string };
+    let signalProviderStarted!: () => void;
+    const providerStarted = new Promise<void>(resolve => { signalProviderStarted = resolve; });
+    let releaseProvider!: () => void;
+    const providerRelease = new Promise<void>(resolve => { releaseProvider = resolve; });
+
+    try {
+      const bounded = runCommand(f, undefined, {
+        ocrProvider: async () => {
+          signalProviderStarted();
+          await providerRelease;
+          return injectedReceipt('PAID RESULT MUST NOT OVERWRITE');
+        },
+      });
+      await providerStarted;
+      await engine.putPage(entry.slug, {
+        type: 'image',
+        page_kind: 'image',
+        title: 'generic-writer.png',
+        content_hash: 'b'.repeat(64),
+        compiled_truth: 'GENERIC WRITER CONTENT',
+      }, { sourceId: 'source-a' });
+      releaseProvider();
+
+      expect(await bounded).toMatchObject({
+        status: 'failed',
+        reservations: 1,
+        provider_attempts: 1,
+        successful_provider_receipts: 1,
+        persisted_imports: 0,
+        failures: 1,
+      });
+      expect(await engine.getPage(entry.slug, { sourceId: 'source-a' })).toMatchObject({
+        content_hash: 'b'.repeat(64),
+        compiled_truth: 'GENERIC WRITER CONTENT',
+      });
+      expect(JSON.parse(readFileSync(join(f.ledgerDir, '2026-08-10.json'), 'utf8')).audit[0]).toMatchObject({
+        state: 'failed',
+        transport_attempted: true,
+        persistence_succeeded: false,
+        outcome: 'failed',
+        failure_stage: 'persistence',
+        provider_receipt: { request_id: 'msg_injected_123', actual_usd_micros: 150 },
+      });
+    } finally {
+      releaseProvider();
+      await engine.disconnect();
+    }
   });
 
   test('no source/page await point exists between final revalidation and provider dispatch', async () => {
@@ -1055,7 +1645,7 @@ describe('bounded run behavior', () => {
       ocrProvider: async () => {
         providerSawStableSourceAndPage =
           state.registeredRoot === f.root && state.syntheticPageDrift === false;
-        return 'stable OCR';
+        return injectedReceipt('stable OCR');
       },
     });
     expect(report).toMatchObject({ status: 'completed', succeeded: 1 });
@@ -1078,7 +1668,7 @@ describe('bounded run behavior', () => {
       setConfig: async () => {},
     } as unknown as BrainEngine;
     const report = await runCommand(f, undefined, {
-      ocrProvider: async () => { providerCalls++; return 'text'; },
+      ocrProvider: async () => { providerCalls++; return injectedReceipt('text'); },
     });
     expect(sourceReads).toBeGreaterThanOrEqual(2);
     expect(providerCalls).toBe(0);
@@ -1096,7 +1686,7 @@ describe('bounded run behavior', () => {
       setConfig: async () => {},
     } as unknown as BrainEngine;
     const report = await runCommand(f, undefined, {
-      ocrProvider: async () => { providerCalls++; return 'text'; },
+      ocrProvider: async () => { providerCalls++; return injectedReceipt('text'); },
     });
     expect(providerCalls).toBe(0);
     expect(report?.status).toBe('rejected');
@@ -1116,7 +1706,7 @@ describe('bounded run behavior', () => {
     writeFileSync(f.manifestPath, `${JSON.stringify(entry)}\n`);
     let providerCalls = 0;
     const report = await runCommand(f, undefined, {
-      ocrProvider: async () => { providerCalls++; return 'text'; },
+      ocrProvider: async () => { providerCalls++; return injectedReceipt('text'); },
     });
     expect(providerCalls).toBe(0);
     expect(report?.status).toBe('rejected');
@@ -1137,14 +1727,14 @@ describe('bounded run behavior', () => {
       setConfig: async () => {},
     } as unknown as BrainEngine;
     const report = await runCommand(f, undefined, {
-      ocrProvider: async () => { providerCalls++; return 'text'; },
+      ocrProvider: async () => { providerCalls++; return injectedReceipt('text'); },
     });
     expect(providerCalls).toBe(0);
     expect(report?.status).toBe('rejected');
     expect(report?.processed).toBe(0);
   });
 
-  test('post-reservation path escape cannot alter provider bytes or persist the escaped path', async () => {
+  test('post-reservation path escape consumes the reservation and makes zero transport attempts', async () => {
     const f = fixture();
     let providerCalls = 0;
     let providerBytes = '';
@@ -1168,12 +1758,12 @@ describe('bounded run behavior', () => {
       ocrProvider: async (bytes) => {
         providerCalls++;
         providerBytes = bytes.toString('utf8');
-        return 'text';
+        return injectedReceipt('text');
       },
     });
-    expect(providerCalls).toBe(1);
-    expect(providerBytes).toBe('png-0');
-    expect(report?.status).toBe('failed');
+    expect(providerCalls).toBe(0);
+    expect(providerBytes).toBe('');
+    expect(report).toMatchObject({ status: 'failed', processed: 1, succeeded: 0, failed: 1 });
   });
 
   test('provider/import failure stops immediately without processing later entries', async () => {

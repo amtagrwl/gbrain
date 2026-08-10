@@ -1,29 +1,40 @@
 import type { BrainEngine } from '../core/engine.ts';
-import { prepareBoundedImageOcrInput } from '../core/import-file.ts';
+import {
+  captureBoundedImageOcrExpectedPageState,
+  prepareBoundedImageOcrInput,
+  type BoundedImageOcrExpectedPageState,
+} from '../core/import-file.ts';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import {
+  IMAGE_OCR_POLICY_MODEL,
   validateImageOcrCaps,
   type ImageOcrCaps,
   OcrBudgetCapError,
   OcrBudgetLockError,
   OcrBudgetLedger,
+  type OcrFailureOutcome,
+  type OcrFailureStage,
   type OcrReservation,
 } from '../core/image-ocr-budget.ts';
 import {
   defaultImageOcrBudgetDirectory,
   ImageOcrManifestError,
   importValidatedImageOcrEntry,
+  inspectImageOcrRegisteredRoot,
   parseAndValidateImageOcrManifest,
+  readImageOcrSourceFile,
   type ValidatedImageOcrManifestEntry,
   type ImageOcrRunReport,
   type ValidatedImageOcrManifest,
 } from '../core/image-ocr-run.ts';
 import {
   buildBoundedImageOcrRequestBody,
+  BoundedImageOcrReceiptError,
   loadBoundedImageOcrProviderConfig,
+  parseBoundedImageOcrReceipt,
   requestBoundedImageOcr,
+  type BoundedImageOcrReceipt,
   type BoundedImageOcrProviderConfig,
 } from '../core/image-ocr-provider.ts';
 import {
@@ -175,6 +186,16 @@ export function emitImageOcrRunTerminalFailure(
     succeeded: 0,
     failed: 0,
     skipped: 0,
+    reservations: 0,
+    provider_attempts: 0,
+    successful_provider_receipts: 0,
+    observed_input_tokens: 0,
+    observed_cache_creation_input_tokens: 0,
+    observed_cache_read_input_tokens: 0,
+    observed_output_tokens: 0,
+    observed_usd: 0,
+    persisted_imports: 0,
+    failures: 0,
     daily_calls_before: null,
     daily_calls_after: null,
     daily_usd_reserved_before: null,
@@ -202,9 +223,52 @@ export interface ImageOcrCommandOptions {
     entry: ValidatedImageOcrManifestEntry,
     beforeProviderAttempt: () => Promise<OcrReservation>,
     imageImportFenceToken: ImageImportFenceToken,
+    lifecycle: ImageOcrReservationLifecycle,
   ) => void | Promise<void>;
-  ocrProvider?: (imgBuf: Buffer, mime: string) => Promise<string>;
+  ocrProvider?: (
+    imgBuf: Buffer,
+    mime: string,
+  ) => Promise<BoundedImageOcrReceipt>;
   imageImportFenceRoot?: string;
+}
+
+type ImageOcrLifecycleState =
+  | 'unreserved'
+  | 'reserved'
+  | 'transport_attempted'
+  | 'receipt_validated'
+  | 'persisted'
+  | 'failed';
+
+export interface ImageOcrReservationLifecycle {
+  readonly state: ImageOcrLifecycleState;
+  readonly transportAttempted: boolean;
+  readonly receiptValidated: boolean;
+  readonly persistenceSucceeded: boolean;
+  recordTransportAttempt(): void;
+  recordProviderReceipt(receipt: BoundedImageOcrReceipt): void;
+  recordPersistenceSuccess(): void;
+  recordFailure(stage: OcrFailureStage, outcome: OcrFailureOutcome): void;
+}
+
+function normalizeInjectedProviderReceipt(
+  value: BoundedImageOcrReceipt,
+): BoundedImageOcrReceipt {
+  const validated = parseBoundedImageOcrReceipt({
+    id: value?.requestId,
+    type: 'message',
+    model: value?.model,
+    stop_reason: value?.stopReason,
+    content: [{ type: 'text', text: value?.text }],
+    usage: {
+      input_tokens: value?.inputTokens,
+      cache_creation_input_tokens: value?.cacheCreationInputTokens,
+      cache_read_input_tokens: value?.cacheReadInputTokens,
+      output_tokens: value?.outputTokens,
+    },
+  });
+  if (value.actualUsd !== validated.actualUsd) throw new BoundedImageOcrReceiptError();
+  return validated;
 }
 
 async function callConfirmedImageOcrProvider(
@@ -212,43 +276,117 @@ async function callConfirmedImageOcrProvider(
   entry: ValidatedImageOcrManifestEntry,
   providerConfig: BoundedImageOcrProviderConfig | null,
   beforeProviderAttempt: () => Promise<OcrReservation>,
+  lifecycle: ImageOcrReservationLifecycle,
   provider?: ImageOcrCommandOptions['ocrProvider'],
-  attempt?: { attempted: boolean; succeeded: boolean },
-): Promise<string> {
-  const input = await prepareBoundedImageOcrInput(
+): Promise<{
+  receipt: BoundedImageOcrReceipt;
+  expectedPageState: BoundedImageOcrExpectedPageState;
+}> {
+  await beforeProviderAttempt();
+
+  // Decode/build from a descriptor-bound post-reservation snapshot first. Any
+  // async codec work completes before the final source/page re-read below.
+  const sourceBytes = readImageOcrSourceFile({
+    filePath: entry.file_path,
+    imageSlug: entry.slug,
+    registeredRoot: entry.registered_root,
+    expectedHash: entry.sha256,
+    expectedFileIdentity: entry.file_identity,
+  });
+  const prepared = await prepareBoundedImageOcrInput(
     entry.file_path,
     entry.slug,
     entry.registered_root,
     entry.sha256,
+    sourceBytes,
   );
+  if (
+    prepared.info.format !== entry.image_format
+    || prepared.info.width !== entry.image_width
+    || prepared.info.height !== entry.image_height
+    || prepared.info.pixels !== entry.image_pixels
+    || prepared.info.visualTokens !== entry.visual_tokens
+    || prepared.info.worstCaseUsd !== entry.worst_case_usd
+  ) {
+    throw new Error('Bounded image OCR format, dimensions, tokens, or cost changed after preflight');
+  }
+  // These are the final awaits before transport dispatch.
   const currentSource = (await engine.listAllSources({ includeArchived: false }))
     .find(source => source.id === entry.source_id);
-  if (!currentSource?.local_path || resolve(currentSource.local_path) !== entry.registered_root) {
+  if (!currentSource?.local_path) throw new Error('Registered source disappeared after reservation');
+  const currentRoot = inspectImageOcrRegisteredRoot(currentSource.local_path);
+  if (
+    currentRoot.canonicalPath !== entry.registered_root
+    || currentRoot.identity.device !== entry.registered_root_identity.device
+    || currentRoot.identity.inode !== entry.registered_root_identity.inode
+  ) {
     throw new Error('Registered source root changed after manifest validation');
   }
   const existing = await engine.getPage(entry.slug, { sourceId: entry.source_id });
   if (existing?.content_hash === entry.sha256) {
     throw new Error('Source-scoped image already exists with the manifest hash');
   }
-  await beforeProviderAttempt();
-  if (attempt) attempt.attempted = true;
-  try {
-    let text: string;
-    if (provider) {
-      text = await provider(input.buf, input.mime);
-    } else {
-      text = await requestBoundedImageOcr({
+  const expectedPageState = captureBoundedImageOcrExpectedPageState(existing);
+
+  // Reopen once more after the final await. The exact final buffer must match
+  // the decoded/request-body source byte-for-byte. From here to invoking the
+  // raw transport there is no await point.
+  const finalRoot = inspectImageOcrRegisteredRoot(entry.registered_root);
+  if (
+    finalRoot.canonicalPath !== entry.registered_root
+    || finalRoot.identity.device !== entry.registered_root_identity.device
+    || finalRoot.identity.inode !== entry.registered_root_identity.inode
+  ) {
+    throw new Error('Registered source root changed during final validation');
+  }
+  const finalSourceBytes = readImageOcrSourceFile({
+    filePath: entry.file_path,
+    imageSlug: entry.slug,
+    registeredRoot: entry.registered_root,
+    expectedHash: entry.sha256,
+    expectedFileIdentity: entry.file_identity,
+  });
+  if (!finalSourceBytes.equals(sourceBytes)) {
+    throw new Error('Bounded image OCR source bytes changed during final validation');
+  }
+  const requestBody = buildBoundedImageOcrRequestBody(prepared.buf, prepared.mime);
+
+  let receipt: BoundedImageOcrReceipt;
+  if (provider) {
+    lifecycle.recordTransportAttempt();
+    let providerValue: Awaited<ReturnType<NonNullable<ImageOcrCommandOptions['ocrProvider']>>>;
+    try {
+      providerValue = await provider(prepared.buf, prepared.mime);
+    } catch {
+      lifecycle.recordFailure('provider_transport', 'ambiguous');
+      throw new Error('Image OCR provider transport failed');
+    }
+    try {
+      receipt = normalizeInjectedProviderReceipt(providerValue);
+    } catch {
+      lifecycle.recordFailure('provider_receipt', 'ambiguous');
+      throw new Error('Image OCR provider receipt was invalid');
+    }
+  } else {
+    try {
+      receipt = await requestBoundedImageOcr({
         apiKey: providerConfig!.apiKey,
         providerBaseUrls: providerConfig!.providerBaseUrls,
-        body: buildBoundedImageOcrRequestBody(input.buf, input.mime),
+        body: requestBody,
+        onTransportAttempt: () => lifecycle.recordTransportAttempt(),
       });
+    } catch (error) {
+      if (lifecycle.state === 'transport_attempted') {
+        lifecycle.recordFailure(
+          error instanceof BoundedImageOcrReceiptError ? 'provider_receipt' : 'provider_transport',
+          'ambiguous',
+        );
+      }
+      throw new Error('Image OCR provider call failed');
     }
-    if (text.trim().length === 0) throw new Error('empty OCR response');
-    if (attempt) attempt.succeeded = true;
-    return text;
-  } catch {
-    throw new Error('Image OCR provider call failed');
   }
+  lifecycle.recordProviderReceipt(receipt);
+  return { receipt, expectedPageState };
 }
 
 async function bumpOcrCounter(engine: BrainEngine, key: string): Promise<void> {
@@ -280,11 +418,24 @@ async function executeConfirmedImageOcrRun(input: {
   let terminalError: ImageOcrRunReport['terminal_error'];
   let before: ReturnType<OcrBudgetLedger['snapshot']> | null = null;
   let after: ReturnType<OcrBudgetLedger['snapshot']> | null = null;
+  let providerAttempts = 0;
+  let successfulProviderReceipts = 0;
+  let observedInputTokens = 0;
+  let observedCacheCreationInputTokens = 0;
+  let observedCacheReadInputTokens = 0;
+  let observedOutputTokens = 0;
+  let observedUsdMicros = 0;
+  let persistedImports = 0;
 
   for (let index = 0; index < input.manifest.entries.length; index++) {
     const entry = input.manifest.entries[index];
     let attemptNow: Date | null = null;
     let ledger: OcrBudgetLedger | null = null;
+    let reservation: OcrReservation | null = null;
+    let lifecycleState: ImageOcrLifecycleState = 'unreserved';
+    let transportAttempted = false;
+    let receiptValidated = false;
+    let persistenceSucceeded = false;
     let callbackInvocations = 0;
     let reservationMade = false;
     let postReservationFailure = false;
@@ -292,6 +443,59 @@ async function executeConfirmedImageOcrRun(input: {
     let runError: unknown;
     let closeFailed = false;
     let stop = false;
+
+    const activeReservation = (): { ledger: OcrBudgetLedger; reservation: OcrReservation } => {
+      const heldLedger = ledger as OcrBudgetLedger | null;
+      const heldReservation = reservation as OcrReservation | null;
+      if (!heldLedger || !heldReservation || !reservationMade) {
+        throw new Error('OCR lifecycle event occurred without a durable reservation');
+      }
+      return { ledger: heldLedger, reservation: heldReservation };
+    };
+    const lifecycle: ImageOcrReservationLifecycle = {
+      get state() { return lifecycleState; },
+      get transportAttempted() { return transportAttempted; },
+      get receiptValidated() { return receiptValidated; },
+      get persistenceSucceeded() { return persistenceSucceeded; },
+      recordTransportAttempt() {
+        if (lifecycleState !== 'reserved') throw new Error('Invalid OCR lifecycle transport transition');
+        const active = activeReservation();
+        active.ledger.recordTransportAttempt(active.reservation);
+        lifecycleState = 'transport_attempted';
+        transportAttempted = true;
+        providerAttempts++;
+      },
+      recordProviderReceipt(receiptValue) {
+        if (lifecycleState !== 'transport_attempted') throw new Error('Invalid OCR lifecycle receipt transition');
+        const receipt = normalizeInjectedProviderReceipt(receiptValue);
+        const active = activeReservation();
+        active.ledger.recordProviderReceipt(active.reservation, receipt);
+        lifecycleState = 'receipt_validated';
+        receiptValidated = true;
+        successfulProviderReceipts++;
+        observedInputTokens += receipt.inputTokens;
+        observedCacheCreationInputTokens += receipt.cacheCreationInputTokens;
+        observedCacheReadInputTokens += receipt.cacheReadInputTokens;
+        observedOutputTokens += receipt.outputTokens;
+        observedUsdMicros += Math.round(receipt.actualUsd * 1_000_000);
+      },
+      recordPersistenceSuccess() {
+        if (lifecycleState !== 'receipt_validated') throw new Error('Invalid OCR lifecycle persistence transition');
+        const active = activeReservation();
+        active.ledger.recordPersistenceSuccess(active.reservation);
+        lifecycleState = 'persisted';
+        persistenceSucceeded = true;
+        persistedImports++;
+      },
+      recordFailure(stage, outcome) {
+        if (!['reserved', 'transport_attempted', 'receipt_validated'].includes(lifecycleState)) {
+          throw new Error('Invalid OCR lifecycle failure transition');
+        }
+        const active = activeReservation();
+        active.ledger.recordFailure(active.reservation, stage, outcome);
+        lifecycleState = 'failed';
+      },
+    };
 
     try {
       await withImageImportFence(async (fenceToken) => {
@@ -306,8 +510,9 @@ async function executeConfirmedImageOcrRun(input: {
           }
 
           try {
-            // The clock and date-ledger reservation intentionally happen only
-            // after the adapter's final source/page/path/hash revalidation.
+            // The clock and date-ledger reservation intentionally happen while
+            // the shared import fence is held. The adapter then performs the
+            // required post-reservation source/page/file revalidation.
             attemptNow = input.attemptClock();
             ledger = OcrBudgetLedger.acquire({
               directory: input.ledgerDirectory,
@@ -321,7 +526,7 @@ async function executeConfirmedImageOcrRun(input: {
 
             const exceeded = ledger.nextCapExceeded();
             if (exceeded) throw new OcrBudgetCapError(exceeded);
-            const reservation = ledger.reserve({
+            const madeReservation = ledger.reserve({
               index,
               sourceId: entry.source_id,
               slug: entry.slug,
@@ -329,16 +534,18 @@ async function executeConfirmedImageOcrRun(input: {
               registeredRoot: entry.registered_root,
               sha256: entry.sha256,
             });
+            reservation = madeReservation;
             reservationMade = true;
+            lifecycleState = 'reserved';
             processed++;
             after = ledger.snapshot();
             try {
-              await input.afterReserve?.(entry, reservation);
+              await input.afterReserve?.(entry, madeReservation);
             } catch (error) {
               postReservationFailure = true;
               throw error;
             }
-            return reservation;
+            return madeReservation;
           } catch (error) {
             callbackError = error;
             throw error;
@@ -346,12 +553,15 @@ async function executeConfirmedImageOcrRun(input: {
         };
 
         try {
-          await input.importEntry(entry, beforeProviderAttempt, fenceToken);
+          await input.importEntry(entry, beforeProviderAttempt, fenceToken, lifecycle);
           if (callbackInvocations !== 1) {
             throw new Error('Provider adapter did not invoke beforeProviderAttempt exactly once');
           }
           if (callbackError) throw callbackError;
           if (!reservationMade) throw new Error('Provider adapter reached no durable OCR reservation');
+          if (lifecycle.state !== 'persisted') {
+            throw new Error('Provider adapter did not reconcile OCR persistence');
+          }
         } finally {
           fenceHeld = false;
         }
@@ -359,6 +569,23 @@ async function executeConfirmedImageOcrRun(input: {
       succeeded++;
     } catch (error) {
       runError = error;
+      if (reservationMade && lifecycle.state !== 'persisted' && lifecycle.state !== 'failed') {
+        const stage: OcrFailureStage = lifecycle.state === 'receipt_validated'
+          ? 'persistence'
+          : lifecycle.state === 'transport_attempted'
+            ? 'provider_transport'
+            : 'post_reservation_validation';
+        const outcome: OcrFailureOutcome = (
+          lifecycle.state === 'transport_attempted' || lifecycle.state === 'receipt_validated'
+        )
+          ? 'ambiguous'
+          : 'failed';
+        try {
+          lifecycle.recordFailure(stage, outcome);
+        } catch (auditError) {
+          runError = auditError;
+        }
+      }
     } finally {
       const heldLedger = ledger as OcrBudgetLedger | null;
       if (heldLedger) {
@@ -388,6 +615,16 @@ async function executeConfirmedImageOcrRun(input: {
           succeeded,
           failed,
           skipped: input.manifest.entries.length - index,
+          reservations: processed,
+          provider_attempts: providerAttempts,
+          successful_provider_receipts: successfulProviderReceipts,
+          observed_input_tokens: observedInputTokens,
+          observed_cache_creation_input_tokens: observedCacheCreationInputTokens,
+          observed_cache_read_input_tokens: observedCacheReadInputTokens,
+          observed_output_tokens: observedOutputTokens,
+          observed_usd: observedUsdMicros / 1_000_000,
+          persisted_imports: persistedImports,
+          failures: failed,
           daily_calls_before: null,
           daily_calls_after: null,
           daily_usd_reserved_before: null,
@@ -462,6 +699,16 @@ async function executeConfirmedImageOcrRun(input: {
     succeeded,
     failed,
     skipped,
+    reservations: processed,
+    provider_attempts: providerAttempts,
+    successful_provider_receipts: successfulProviderReceipts,
+    observed_input_tokens: observedInputTokens,
+    observed_cache_creation_input_tokens: observedCacheCreationInputTokens,
+    observed_cache_read_input_tokens: observedCacheReadInputTokens,
+    observed_output_tokens: observedOutputTokens,
+    observed_usd: observedUsdMicros / 1_000_000,
+    persisted_imports: persistedImports,
+    failures: failed,
     daily_calls_before: finalBefore?.callsReserved ?? null,
     daily_calls_after: finalAfter?.callsReserved ?? null,
     daily_usd_reserved_before: finalBefore?.usdReserved ?? null,
@@ -500,6 +747,13 @@ export async function runImageOcrRun(
     // any reservation/provider access. This command never enumerates sources or
     // files beyond the entries named by that manifest.
     manifest = await parseAndValidateImageOcrManifest(engine, parsed.manifestPath);
+    const underReservedIndex = manifest.entries.findIndex(
+      entry => entry.worst_case_usd > parsed!.reserveUsdPerCall,
+    );
+    if (underReservedIndex >= 0) {
+      const entry = manifest.entries[underReservedIndex];
+      throw new ImageOcrManifestError(underReservedIndex, entry.source_id, entry.slug);
+    }
     stage = 'run';
     // Resolve credentials and reject every mutable Anthropic base URL before
     // the first budget lock/reservation. Injected offline providers skip this
@@ -517,23 +771,34 @@ export async function runImageOcrRun(
       afterReserve: options.afterReserve,
       imageImportFenceRoot: options.imageImportFenceRoot,
       importEntry: options.importEntry
-        ?? (async (entry, beforeProviderAttempt, fenceToken) => {
-          const attempt = { attempted: false, succeeded: false };
+        ?? (async (entry, beforeProviderAttempt, fenceToken, lifecycle) => {
           try {
-            const ocrText = await callConfirmedImageOcrProvider(
+            const providerResult = await callConfirmedImageOcrProvider(
               engine,
               entry,
               providerConfig,
               beforeProviderAttempt,
+              lifecycle,
               options.ocrProvider,
-              attempt,
             );
-            await importValidatedImageOcrEntry(engine, entry, ocrText, fenceToken);
-          } finally {
-            if (attempt.attempted) {
-              await bumpOcrCounter(engine, 'ocr_attempted');
-              await bumpOcrCounter(engine, attempt.succeeded ? 'ocr_succeeded' : 'ocr_failed_other');
+            try {
+              await importValidatedImageOcrEntry(
+                engine,
+                entry,
+                providerResult.receipt.text,
+                providerResult.expectedPageState,
+                fenceToken,
+              );
+            } catch (error) {
+              lifecycle.recordFailure('persistence', 'failed');
+              throw error;
             }
+            lifecycle.recordPersistenceSuccess();
+          } finally {
+            if (lifecycle.transportAttempted) await bumpOcrCounter(engine, 'ocr_provider_attempts');
+            if (lifecycle.receiptValidated) await bumpOcrCounter(engine, 'ocr_successful_provider_receipts');
+            if (lifecycle.persistenceSucceeded) await bumpOcrCounter(engine, 'ocr_persisted_imports');
+            if (lifecycle.state === 'failed') await bumpOcrCounter(engine, 'ocr_failures');
           }
         }),
     });
@@ -547,6 +812,16 @@ export async function runImageOcrRun(
       succeeded: 0,
       failed: 0,
       skipped: manifest?.entries.length ?? 0,
+      reservations: 0,
+      provider_attempts: 0,
+      successful_provider_receipts: 0,
+      observed_input_tokens: 0,
+      observed_cache_creation_input_tokens: 0,
+      observed_cache_read_input_tokens: 0,
+      observed_output_tokens: 0,
+      observed_usd: 0,
+      persisted_imports: 0,
+      failures: 0,
       daily_calls_before: null,
       daily_calls_after: null,
       daily_usd_reserved_before: null,

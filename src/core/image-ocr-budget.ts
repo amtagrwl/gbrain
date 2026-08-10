@@ -1,15 +1,21 @@
 import {
   closeSync,
   existsSync,
+  fstatSync,
   fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   unlinkSync,
   writeFileSync,
+  type Stats,
 } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { hostname } from 'node:os';
 import { dirname, join } from 'node:path';
+import { canonicalLookup } from './model-pricing.ts';
 
 export const IMAGE_OCR_POLICY_MAX_IMAGES = 1000;
 export const IMAGE_OCR_POLICY_MAX_USD = 10;
@@ -26,6 +32,7 @@ export interface ImageOcrCaps {
 }
 
 interface LedgerAuditEntry {
+  reservation_id: string;
   reserved_at: string;
   manifest_hash: string;
   entry_index: number;
@@ -35,10 +42,27 @@ interface LedgerAuditEntry {
   registered_root: string;
   sha256: string;
   reserved_usd_micros: number;
+  state: 'reserved' | 'transport_attempted' | 'receipt_validated' | 'persisted' | 'failed';
+  transport_attempted: boolean;
+  provider_receipt: LedgerProviderReceipt | null;
+  persistence_succeeded: boolean;
+  outcome: 'pending' | 'ambiguous' | 'persisted' | 'failed';
+  failure_stage: OcrFailureStage | null;
+}
+
+interface LedgerProviderReceipt {
+  request_id: string;
+  model: string;
+  stop_reason: string;
+  input_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+  output_tokens: number;
+  actual_usd_micros: number;
 }
 
 interface LedgerFile {
-  schema_version: 1;
+  schema_version: 2;
   utc_date: string;
   daily_max_images: number;
   daily_max_usd_micros: number;
@@ -47,6 +71,34 @@ interface LedgerFile {
   usd_reserved_micros: number;
   audit: LedgerAuditEntry[];
 }
+
+interface BudgetLockOwner {
+  schema_version: 1;
+  pid: number;
+  ppid: number;
+  process_started_at_ms: number;
+  hostname: string;
+  owner_token: string;
+  utc_date: string;
+  acquired_at: string;
+}
+
+interface FileIdentity {
+  dev: number;
+  ino: number;
+}
+
+interface BudgetLockHandle {
+  directoryFd: number;
+  directoryIdentity: FileIdentity;
+  lockPath: string;
+  ownerFd: number;
+  ownerIdentity: FileIdentity;
+  ownerPath: string;
+  owner: BudgetLockOwner;
+}
+
+const PROCESS_STARTED_AT_MS = Math.max(1, Math.round(Date.now() - process.uptime() * 1000));
 
 export interface OcrBudgetSnapshot {
   utcDate: string;
@@ -70,12 +122,33 @@ export class OcrBudgetCapError extends Error {
 }
 
 export interface OcrReservation {
+  readonly reservationId: string;
   readonly utcDate: string;
   readonly sourceId: string;
   readonly slug: string;
   readonly filePath: string;
   readonly registeredRoot: string;
   readonly sha256: string;
+}
+
+export type OcrFailureStage =
+  | 'post_reservation_validation'
+  | 'provider_transport'
+  | 'provider_receipt'
+  | 'persistence'
+  | 'adapter';
+
+export type OcrFailureOutcome = 'failed' | 'ambiguous';
+
+export interface OcrReceiptAccounting {
+  readonly requestId: string;
+  readonly model: string;
+  readonly stopReason: string;
+  readonly inputTokens: number;
+  readonly cacheCreationInputTokens: number;
+  readonly cacheReadInputTokens: number;
+  readonly outputTokens: number;
+  readonly actualUsd: number;
 }
 
 function usdToMicros(value: number): number {
@@ -127,6 +200,133 @@ function fsyncDirectory(path: string): void {
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
+function fileIdentity(stat: Stats): FileIdentity {
+  return { dev: stat.dev, ino: stat.ino };
+}
+
+function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function ownerMatches(actual: unknown, expected: BudgetLockOwner): boolean {
+  if (!actual || typeof actual !== 'object' || Array.isArray(actual)) return false;
+  const owner = actual as Partial<BudgetLockOwner>;
+  return owner.schema_version === expected.schema_version
+    && owner.pid === expected.pid
+    && owner.ppid === expected.ppid
+    && owner.process_started_at_ms === expected.process_started_at_ms
+    && owner.hostname === expected.hostname
+    && owner.owner_token === expected.owner_token
+    && owner.utc_date === expected.utc_date
+    && owner.acquired_at === expected.acquired_at;
+}
+
+function verifyBudgetLockOwnership(lock: BudgetLockHandle): boolean {
+  let currentDirectoryFd: number | null = null;
+  let currentOwnerFd: number | null = null;
+  try {
+    const heldDirectory = fstatSync(lock.directoryFd);
+    const heldOwner = fstatSync(lock.ownerFd);
+    if (
+      !heldDirectory.isDirectory()
+      || !heldOwner.isFile()
+      || !sameIdentity(fileIdentity(heldDirectory), lock.directoryIdentity)
+      || !sameIdentity(fileIdentity(heldOwner), lock.ownerIdentity)
+    ) return false;
+
+    currentDirectoryFd = openSync(lock.lockPath, 'r');
+    const currentDirectory = fstatSync(currentDirectoryFd);
+    if (
+      !currentDirectory.isDirectory()
+      || !sameIdentity(fileIdentity(currentDirectory), lock.directoryIdentity)
+    ) return false;
+
+    currentOwnerFd = openSync(lock.ownerPath, 'r');
+    const currentOwner = fstatSync(currentOwnerFd);
+    if (!currentOwner.isFile() || !sameIdentity(fileIdentity(currentOwner), lock.ownerIdentity)) {
+      return false;
+    }
+    const parsed = JSON.parse(readFileSync(currentOwnerFd, 'utf8')) as unknown;
+    return ownerMatches(parsed, lock.owner);
+  } catch {
+    return false;
+  } finally {
+    if (currentOwnerFd !== null) closeSync(currentOwnerFd);
+    if (currentDirectoryFd !== null) closeSync(currentDirectoryFd);
+  }
+}
+
+function closeBudgetLockDescriptors(lock: BudgetLockHandle): void {
+  closeSync(lock.ownerFd);
+  closeSync(lock.directoryFd);
+}
+
+function releaseBudgetLock(lock: BudgetLockHandle): void {
+  const owned = verifyBudgetLockOwnership(lock);
+  closeBudgetLockDescriptors(lock);
+  if (!owned) throw new OcrBudgetLockError(lock.lockPath);
+
+  // The owner filename contains 256 bits of randomness. A late owner can only
+  // remove its own file; if the fixed directory was externally replaced, its
+  // token-named path is absent and a replacement owner's file keeps rmdir from
+  // succeeding. Never recursively remove this directory.
+  unlinkSync(lock.ownerPath);
+  rmdirSync(lock.lockPath);
+  fsyncDirectory(dirname(lock.lockPath));
+}
+
+function acquireBudgetLock(directory: string, date: string, now: Date): BudgetLockHandle {
+  const lockPath = join(directory, `${date}.lock`);
+  try {
+    mkdirSync(lockPath, { mode: 0o700 });
+    fsyncDirectory(directory);
+  } catch {
+    throw new OcrBudgetLockError(lockPath);
+  }
+
+  const ownerToken = randomBytes(32).toString('hex');
+  const owner: BudgetLockOwner = {
+    schema_version: 1,
+    pid: process.pid,
+    ppid: process.ppid,
+    process_started_at_ms: PROCESS_STARTED_AT_MS,
+    hostname: hostname(),
+    owner_token: ownerToken,
+    utc_date: date,
+    acquired_at: now.toISOString(),
+  };
+  const ownerPath = join(lockPath, `owner-${ownerToken}.json`);
+  let directoryFd: number | null = null;
+  let ownerFd: number | null = null;
+  try {
+    directoryFd = openSync(lockPath, 'r');
+    ownerFd = openSync(ownerPath, 'wx', 0o600);
+    writeFileSync(ownerFd, `${JSON.stringify(owner)}\n`, 'utf8');
+    fsyncSync(ownerFd);
+    fsyncSync(directoryFd);
+    const directoryStat = fstatSync(directoryFd);
+    const ownerStat = fstatSync(ownerFd);
+    if (!directoryStat.isDirectory() || !ownerStat.isFile()) {
+      throw new Error('Invalid image OCR budget lock filesystem objects');
+    }
+    return {
+      directoryFd,
+      directoryIdentity: fileIdentity(directoryStat),
+      lockPath,
+      ownerFd,
+      ownerIdentity: fileIdentity(ownerStat),
+      ownerPath,
+      owner,
+    };
+  } catch {
+    if (ownerFd !== null) closeSync(ownerFd);
+    if (directoryFd !== null) closeSync(directoryFd);
+    // Leave any partial lock in place. Its state is ambiguous and requires
+    // explicit operator recovery after confirming that no owner remains.
+    throw new OcrBudgetLockError(lockPath);
+  }
+}
+
 function writeLedgerDurably(path: string, ledger: LedgerFile): void {
   const tmp = `${path}.tmp-${process.pid}`;
   const bytes = `${JSON.stringify(ledger)}\n`;
@@ -141,11 +341,80 @@ function writeLedgerDurably(path: string, ledger: LedgerFile): void {
   fsyncDirectory(dirname(path));
 }
 
+function providerReceiptIsValid(receipt: LedgerProviderReceipt | null): boolean {
+  const price = canonicalLookup(IMAGE_OCR_POLICY_MODEL);
+  return !!receipt && !!price
+    && typeof receipt.request_id === 'string' && receipt.request_id.length > 0
+    && receipt.model === IMAGE_OCR_POLICY_MODEL
+    && receipt.stop_reason === 'end_turn'
+    && Number.isSafeInteger(receipt.input_tokens) && receipt.input_tokens >= 0
+    && receipt.cache_creation_input_tokens === 0
+    && receipt.cache_read_input_tokens === 0
+    && Number.isSafeInteger(receipt.output_tokens) && receipt.output_tokens >= 0
+    && Number.isSafeInteger(receipt.actual_usd_micros) && receipt.actual_usd_micros >= 0
+    && receipt.actual_usd_micros === Math.round(
+      receipt.input_tokens * price.input + receipt.output_tokens * price.output,
+    );
+}
+
+function auditLifecycleIsValid(entry: LedgerAuditEntry): boolean {
+  const failureStages: ReadonlySet<string> = new Set([
+    'post_reservation_validation',
+    'provider_transport',
+    'provider_receipt',
+    'persistence',
+    'adapter',
+  ]);
+  if (
+    typeof entry.transport_attempted !== 'boolean'
+    || typeof entry.persistence_succeeded !== 'boolean'
+    || !['reserved', 'transport_attempted', 'receipt_validated', 'persisted', 'failed'].includes(entry.state)
+    || !['pending', 'ambiguous', 'persisted', 'failed'].includes(entry.outcome)
+    || !(entry.failure_stage === null || failureStages.has(entry.failure_stage))
+  ) return false;
+
+  switch (entry.state) {
+    case 'reserved':
+      return !entry.transport_attempted && entry.provider_receipt === null
+        && !entry.persistence_succeeded && entry.outcome === 'pending' && entry.failure_stage === null;
+    case 'transport_attempted':
+      return entry.transport_attempted && entry.provider_receipt === null
+        && !entry.persistence_succeeded && entry.outcome === 'ambiguous' && entry.failure_stage === null;
+    case 'receipt_validated':
+      return entry.transport_attempted && providerReceiptIsValid(entry.provider_receipt)
+        && !entry.persistence_succeeded && entry.outcome === 'pending' && entry.failure_stage === null;
+    case 'persisted':
+      return entry.transport_attempted && providerReceiptIsValid(entry.provider_receipt)
+        && entry.persistence_succeeded && entry.outcome === 'persisted' && entry.failure_stage === null;
+    case 'failed':
+      if (
+        entry.persistence_succeeded
+        || entry.failure_stage === null
+        || (entry.outcome !== 'failed' && entry.outcome !== 'ambiguous')
+        || (entry.provider_receipt && (!entry.transport_attempted || !providerReceiptIsValid(entry.provider_receipt)))
+      ) return false;
+      if (entry.failure_stage === 'post_reservation_validation') {
+        return !entry.transport_attempted && entry.provider_receipt === null && entry.outcome === 'failed';
+      }
+      if (entry.failure_stage === 'provider_transport' || entry.failure_stage === 'provider_receipt') {
+        return entry.transport_attempted && entry.provider_receipt === null && entry.outcome === 'ambiguous';
+      }
+      if (entry.failure_stage === 'persistence') {
+        return entry.transport_attempted && providerReceiptIsValid(entry.provider_receipt);
+      }
+      return !entry.persistence_succeeded
+        && entry.failure_stage !== null
+        && (entry.outcome === 'failed' || entry.outcome === 'ambiguous')
+        && (!entry.provider_receipt || (entry.transport_attempted && providerReceiptIsValid(entry.provider_receipt)));
+  }
+}
+
 function parseLedger(path: string, expectedDate: string): LedgerFile {
   const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<LedgerFile>;
   const auditValid = Array.isArray(parsed.audit) && parsed.audit.every((entry): entry is LedgerAuditEntry => (
     !!entry
     && typeof entry === 'object'
+    && /^[a-f0-9]{64}$/.test(entry.reservation_id)
     && typeof entry.reserved_at === 'string'
     && entry.reserved_at.slice(0, 10) === expectedDate
     && /^[a-f0-9]{64}$/.test(entry.manifest_hash)
@@ -157,11 +426,12 @@ function parseLedger(path: string, expectedDate: string): LedgerFile {
     && /^[a-f0-9]{64}$/.test(entry.sha256)
     && Number.isSafeInteger(entry.reserved_usd_micros)
     && entry.reserved_usd_micros >= usdToMicros(IMAGE_OCR_POLICY_MIN_RESERVE_USD)
+    && auditLifecycleIsValid(entry)
   ));
   const audit = auditValid ? parsed.audit as LedgerAuditEntry[] : [];
   const auditUsd = audit.reduce((sum, entry) => sum + entry.reserved_usd_micros, 0);
   if (
-    parsed.schema_version !== 1
+    parsed.schema_version !== 2
     || parsed.utc_date !== expectedDate
     || !Number.isSafeInteger(parsed.daily_max_images)
     || (parsed.daily_max_images ?? 0) <= 0
@@ -188,8 +458,7 @@ export class OcrBudgetLedger {
   private closed = false;
 
   private constructor(
-    private readonly lockFd: number,
-    private readonly lockPath: string,
+    private readonly lock: BudgetLockHandle,
     private readonly ledgerPath: string,
     private caps: ImageOcrCaps,
     private readonly manifestHash: string,
@@ -206,16 +475,7 @@ export class OcrBudgetLedger {
     const caps = validateImageOcrCaps(input.caps);
     const date = utcDate(input.now);
     mkdirSync(input.directory, { recursive: true, mode: 0o700 });
-    const lockPath = join(input.directory, `${date}.lock`);
-    let lockFd: number;
-    try {
-      lockFd = openSync(lockPath, 'wx', 0o600);
-      writeFileSync(lockFd, `${JSON.stringify({ pid: process.pid, utc_date: date, acquired_at: input.now.toISOString() })}\n`);
-      fsyncSync(lockFd);
-      fsyncDirectory(input.directory);
-    } catch {
-      throw new OcrBudgetLockError(lockPath);
-    }
+    const lock = acquireBudgetLock(input.directory, date, input.now);
 
     const ledgerPath = join(input.directory, `${date}.json`);
     let ledger: LedgerFile;
@@ -224,7 +484,7 @@ export class OcrBudgetLedger {
       ledger = hadLedger
         ? parseLedger(ledgerPath, date)
         : {
-          schema_version: 1 as const,
+          schema_version: 2 as const,
           utc_date: date,
           daily_max_images: caps.maxImages,
           daily_max_usd_micros: usdToMicros(caps.maxUsd),
@@ -234,13 +494,14 @@ export class OcrBudgetLedger {
           audit: [],
         };
     } catch (error) {
-      closeSync(lockFd);
+      closeBudgetLockDescriptors(lock);
       // The lock is intentionally retained: ledger ambiguity must require operator review.
       throw error;
     }
 
     try {
       if (hadLedger) {
+        if (!verifyBudgetLockOwnership(lock)) throw new OcrBudgetLockError(lock.lockPath);
         if (
           caps.maxImages > ledger.daily_max_images
           || usdToMicros(caps.maxUsd) > ledger.daily_max_usd_micros
@@ -261,11 +522,9 @@ export class OcrBudgetLedger {
         maxUsd: microsToUsd(ledger.daily_max_usd_micros),
         reserveUsdPerCall: microsToUsd(ledger.reserve_usd_per_call_micros),
       };
-      return new OcrBudgetLedger(lockFd, lockPath, ledgerPath, effectiveCaps, input.manifestHash, input.now, ledger);
+      return new OcrBudgetLedger(lock, ledgerPath, effectiveCaps, input.manifestHash, input.now, ledger);
     } catch (error) {
-      closeSync(lockFd);
-      unlinkSync(lockPath);
-      fsyncDirectory(input.directory);
+      releaseBudgetLock(lock);
       throw error;
     }
   }
@@ -287,10 +546,13 @@ export class OcrBudgetLedger {
 
   reserve(entry: { index: number; sourceId: string; slug: string; filePath: string; registeredRoot: string; sha256: string }): OcrReservation {
     if (this.closed) throw new Error('Image OCR budget ledger is closed');
+    if (!verifyBudgetLockOwnership(this.lock)) throw new OcrBudgetLockError(this.lock.lockPath);
     const exceeded = this.nextCapExceeded();
     if (exceeded) throw new OcrBudgetCapError(exceeded);
     const reserveMicros = usdToMicros(this.caps.reserveUsdPerCall);
+    const reservationId = randomBytes(32).toString('hex');
     const reservation: OcrReservation = Object.freeze({
+      reservationId,
       utcDate: this.ledger.utc_date,
       sourceId: entry.sourceId,
       slug: entry.slug,
@@ -303,6 +565,7 @@ export class OcrBudgetLedger {
       calls_reserved: this.ledger.calls_reserved + 1,
       usd_reserved_micros: this.ledger.usd_reserved_micros + reserveMicros,
       audit: [...this.ledger.audit, {
+        reservation_id: reservationId,
         reserved_at: this.now.toISOString(),
         manifest_hash: this.manifestHash,
         entry_index: entry.index,
@@ -312,17 +575,101 @@ export class OcrBudgetLedger {
         registered_root: entry.registeredRoot,
         sha256: entry.sha256,
         reserved_usd_micros: reserveMicros,
+        state: 'reserved',
+        transport_attempted: false,
+        provider_receipt: null,
+        persistence_succeeded: false,
+        outcome: 'pending',
+        failure_stage: null,
       }],
     };
     writeLedgerDurably(this.ledgerPath, this.ledger);
     return reservation;
   }
 
+  recordTransportAttempt(reservation: OcrReservation): void {
+    this.updateReservation(reservation, (entry) => {
+      if (entry.state !== 'reserved') throw new Error('Invalid OCR audit transition to transport_attempted');
+      return {
+        ...entry,
+        state: 'transport_attempted',
+        transport_attempted: true,
+        outcome: 'ambiguous',
+      };
+    });
+  }
+
+  recordProviderReceipt(reservation: OcrReservation, receipt: OcrReceiptAccounting): void {
+    this.updateReservation(reservation, (entry) => {
+      if (entry.state !== 'transport_attempted') throw new Error('Invalid OCR audit transition to receipt_validated');
+      const actualUsdMicros = usdToMicros(receipt.actualUsd);
+      const providerReceipt: LedgerProviderReceipt = {
+        request_id: receipt.requestId,
+        model: receipt.model,
+        stop_reason: receipt.stopReason,
+        input_tokens: receipt.inputTokens,
+        cache_creation_input_tokens: receipt.cacheCreationInputTokens,
+        cache_read_input_tokens: receipt.cacheReadInputTokens,
+        output_tokens: receipt.outputTokens,
+        actual_usd_micros: actualUsdMicros,
+      };
+      if (!providerReceiptIsValid(providerReceipt)) throw new Error('Invalid OCR provider receipt accounting');
+      return {
+        ...entry,
+        state: 'receipt_validated',
+        provider_receipt: providerReceipt,
+        outcome: 'pending',
+      };
+    });
+  }
+
+  recordPersistenceSuccess(reservation: OcrReservation): void {
+    this.updateReservation(reservation, (entry) => {
+      if (entry.state !== 'receipt_validated') throw new Error('Invalid OCR audit transition to persisted');
+      return {
+        ...entry,
+        state: 'persisted',
+        persistence_succeeded: true,
+        outcome: 'persisted',
+      };
+    });
+  }
+
+  recordFailure(
+    reservation: OcrReservation,
+    stage: OcrFailureStage,
+    outcome: OcrFailureOutcome,
+  ): void {
+    this.updateReservation(reservation, (entry) => {
+      if (entry.state === 'persisted' || entry.state === 'failed') {
+        throw new Error('Invalid OCR audit transition to failed');
+      }
+      return {
+        ...entry,
+        state: 'failed',
+        outcome,
+        failure_stage: stage,
+      };
+    });
+  }
+
+  private updateReservation(
+    reservation: OcrReservation,
+    update: (entry: LedgerAuditEntry) => LedgerAuditEntry,
+  ): void {
+    if (this.closed) throw new Error('Image OCR budget ledger is closed');
+    if (!verifyBudgetLockOwnership(this.lock)) throw new OcrBudgetLockError(this.lock.lockPath);
+    const index = this.ledger.audit.findIndex(entry => entry.reservation_id === reservation.reservationId);
+    if (index < 0) throw new Error('Image OCR reservation is not present in the held ledger');
+    const audit = [...this.ledger.audit];
+    audit[index] = update(audit[index]);
+    this.ledger = { ...this.ledger, audit };
+    writeLedgerDurably(this.ledgerPath, this.ledger);
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    closeSync(this.lockFd);
-    unlinkSync(this.lockPath);
-    fsyncDirectory(dirname(this.lockPath));
+    releaseBudgetLock(this.lock);
   }
 }

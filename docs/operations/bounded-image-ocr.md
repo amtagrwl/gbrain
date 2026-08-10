@@ -25,17 +25,33 @@ The input is deterministic JSONL with exactly four fields per line:
 
 Before any provider access, the command validates the complete manifest: unique
 entries, registered source and local root, canonical source-relative slug, absolute
-contained non-symlink file, supported image extension, and exact SHA-256. Any
-mismatch rejects the whole run before the first reservation or provider call.
-The registered root, canonical relative path, current source-scoped page state,
-and the hash of the bytes actually sent are checked again immediately before
-provider dispatch. A named cross-process image-import fence is held from that
-final revalidation through provider access and OCR persistence; routine image
-imports acquire the same fence, so they cannot race a paid result into the
-normal same-hash skip path. Already-imported exact hashes make zero provider
-calls. Files larger than 20 MB, or whose exact serialized UTF-8 Anthropic JSON
-request body exceeds 10 MiB, are rejected during full-manifest preflight before
-reservation and checked again at the private provider boundary.
+contained non-symlink file, supported image extension, and exact SHA-256. The
+registered root itself may not be a symlink; preflight freezes its canonical
+realpath and device/inode identity plus the image file's device/inode identity.
+Any mismatch rejects the whole run before the first reservation or provider call.
+
+The actual magic, structure, single-frame status, dimensions, and decoded-pixel
+bound are validated for PNG, JPEG, GIF, WebP, HEIC/HEIF, and AVIF. Zero-byte,
+malformed, animated/multiframe, zero-dimension, over-8,000-pixel-dimension, and
+over-25,000,000-decoded-pixel inputs fail before reservation. PNG, HEIC/HEIF,
+and AVIF use the installed decoders after bounded metadata inspection; HEIC
+frame handles and AVIF `ispe` metadata are checked before an RGBA decode can be
+requested. HEIC/HEIF and AVIF are re-encoded to a validated PNG wire payload.
+The remaining codecs use strict bounded container/frame parsers. If a supported
+codec cannot satisfy these checks, the paid lane rejects it rather than weakening
+the bound.
+
+After the durable reservation, the command repeats byte, SHA, file identity,
+format, frame, dimension, pixel, token, source-root, and source-scoped page-state
+validation from a no-follow file descriptor. It builds the wire body from that
+validated snapshot. There is no await point between the final synchronous
+file/body check and transport dispatch. Any drift consumes the conservative
+reservation but makes zero transport attempts. A named cross-process image-import
+fence is held from final revalidation through provider access and OCR persistence;
+routine image imports acquire the same fence. Already-imported exact hashes make
+zero provider calls. Files larger than 20 MB, or whose exact serialized UTF-8
+Anthropic JSON request body exceeds 10 MiB, are rejected during full-manifest
+preflight and checked again at the private provider boundary.
 
 ## Budget and failure semantics
 
@@ -50,26 +66,56 @@ It constructs one exact JSON request for
 and performs one `fetch` attempt with no retry loop. Both
 `ANTHROPIC_BASE_URL` and a configured Anthropic provider base URL are rejected;
 the lane never inherits expansion-model or gateway endpoint configuration.
-Anthropic documents Haiku 4.5 standard-resolution vision at no more than 1,568
-visual input tokens. The coded cost proof adds a conservative 500 input tokens
-for the fixed prompt/request overhead and uses the current official prices of
-$1/MTok input and $5/MTok output: `(2,068 × $1/MTok) + (1,024 × $5/MTok) =
-$0.007188`, leaving $0.002812 inside each $0.01 reservation. The proof is pinned
-to this named model's current official price contract; a pricing or model change
-requires policy/test review. Provider credits or a workspace billing limit are
-an outer circuit breaker, not a substitute for the local call/spend controls.
+Anthropic documents Haiku 4.5 standard-resolution vision as scaling within a
+1,568-pixel long edge and about 1.15 megapixels, at approximately one visual
+token per 750 scaled pixels, with an 8,000-pixel request dimension limit. The
+implementation rounds scaled dimensions and tokens upward, calculates every
+entry's visual-token/cost bound, and enforces the 25-megapixel local decode
+ceiling before allocation. The global reservation proof retains the stricter
+1,568-visual-token ceiling, adds 500 input tokens for fixed prompt/request
+overhead, and derives the named model's $1/MTok input and $5/MTok output prices
+from the canonical pricing table: `(2,068 × $1/MTok) + (1,024 × $5/MTok) =
+$0.007188`, leaving $0.002812 inside each $0.01 reservation. A manifest entry is
+rejected if its computed worst case exceeds the requested per-call reserve. The
+pricing and image-rule snapshot is pinned to this named model; a pricing, model,
+or provider image-rule change requires policy/test review. Provider credits or a
+workspace billing limit are an outer circuit breaker, not a substitute for the
+local call/spend controls.
 Source: https://platform.claude.com/docs/en/build-with-claude/vision
 
-The ledger lives under `~/.gbrain/ocr-budget/`. The image-import fence is
-acquired first. After any wait and final revalidation, immediately before every
-provider attempt, the command samples a fresh clock value, acquires that UTC
-date's exclusive ledger lock, and durably reserves the call and dollars there.
-A fence wait crossing midnight therefore charges the call to its actual attempt
-date; independent 1,000-image and $10 ceilings apply to every UTC day. Later
-runs may tighten a date's configured limits but can never loosen them. A crash
+The ledger lives under `~/.gbrain/ocr-budget/`. Its fixed UTC-date lock is an
+atomic directory containing a 256-bit random owner-token record with PID, parent
+PID, process start, hostname, and acquisition metadata. Open directory/file
+device-inode identities and the token are verified before every reservation,
+audit transition, and release. Release removes only that token-named owner file
+and never recursively removes a replacement lock. The shared image-import fence
+is acquired first. After any fence wait, the command samples
+a fresh clock value, acquires that UTC date's exclusive ledger lock, and durably
+reserves the call and dollars there. It then performs the complete post-reservation
+revalidation described above and durably records `transport_attempted` immediately
+before invoking transport. A fence wait crossing midnight therefore charges the
+call to its actual attempt date; independent 1,000-image and $10 ceilings apply
+to every UTC day. Later runs may tighten a date's configured limits but can never
+loosen them. A crash
 after reservation over-counts safely. An existing, stale, or ambiguous fence or
 ledger lock is never broken automatically; the run fails closed for operator
-review and requires manual recovery after confirming no holder remains.
+review and requires manual recovery after confirming no holder remains. Ledger
+schema 2 gives every reservation a random ID and a durable lifecycle state:
+`reserved`, `transport_attempted`, `receipt_validated`, `persisted`, or `failed`,
+with explicit pending/failed/ambiguous/persisted outcome, failure stage, receipt,
+usage/cost, and persistence fields. A crash leaves its last conservative state
+in place and never refunds or reopens budget.
+
+Provider success is narrower than HTTP success. The response must be a Messages
+`message` for exactly `claude-haiku-4-5-20251001`, have a nonempty request ID,
+exactly one nonempty text block, `stop_reason: end_turn`, and finite nonnegative
+integer input, cache-creation, cache-read, and output usage fields. `max_tokens`,
+missing/invalid usage, model/type drift, multiple outputs, and empty text are
+rejected without persistence. This fixed request does not enable prompt caching;
+until cache-tier pricing is deliberately added to this pinned contract, nonzero
+cache usage is treated as unreconcilable and fails closed. For valid receipts,
+actual observed cost is computed from the canonical $1/$5 per-MTok rates. It is
+reconciliation data only; admission continues using the conservative reservation.
 
 At either cap, the next entry stops before provider or database access. HTTP
 redirects are rejected rather than followed, preserving the canonical endpoint
@@ -84,9 +130,19 @@ unknown flag are rejected rather than stripped or ignored.
 Every terminal path—including early flag rejection, thin-client rejection,
 engine connection failure, manifest/lock rejection, provider failure, and ledger
 close failure—writes exactly one machine-readable JSON report to stdout. Reports
-never include provider response bodies and preserve completed/reserved counters
-when later cleanup fails; unreadable locked-ledger values are represented as
-`null`.
+separate reservations, provider attempts, valid provider receipts, observed
+input/cache/output tokens and USD, persisted imports, and failures. Reports never
+include OCR text, credentials, or provider response bodies, and preserve
+completed/reserved counters when later cleanup fails; unreadable locked-ledger
+values are represented as `null`.
+
+Immediately before transport, the command also freezes the target page's exact
+write token: existence plus row ID, content generation, update timestamp, hash,
+and deletion state. Persistence enforces that token inside the same database
+transaction. An existing row is locked only if every token field still matches;
+an absent row is claimed with a conflict-free conditional insert. If a generic
+writer changed or created the target during provider latency, the paid receipt
+remains conservatively accounted but OCR text does not overwrite that writer.
 
 The bounded OCR import stores OCR text without invoking multimodal embedding, so
 the command's dollar ledger covers its only provider request. Embedding remains a

@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
+  captureBoundedImageOcrExpectedPageState,
   importImageFile,
   importImageFileWithBoundedOcrText,
   isImageFilePath,
@@ -141,6 +142,7 @@ describe('importImageFile happy path (noEmbed)', () => {
     const routine = await importImageFile(engine, target, slug, noEmbedOptions());
     expect(routine.status).toBe('imported');
     const bytes = Buffer.from('same-image-bytes');
+    const expectedPageState = captureBoundedImageOcrExpectedPageState(await engine.getPage(slug));
     await withImageImportFence(token => importImageFileWithBoundedOcrText(
       engine,
       target,
@@ -149,6 +151,7 @@ describe('importImageFile happy path (noEmbed)', () => {
       tmpDir,
       createHash('sha256').update(bytes).digest('hex'),
       'PAID OCR RESULT',
+      expectedPageState,
       token,
     ), { lockRoot: join(tmpDir, 'image-import-fence') });
 

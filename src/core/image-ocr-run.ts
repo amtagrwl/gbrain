@@ -1,9 +1,14 @@
 import { createHash } from 'node:crypto';
 import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
   lstatSync,
+  openSync,
   readFileSync,
   realpathSync,
   statSync,
+  type Stats,
 } from 'node:fs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { BrainEngine } from './engine.ts';
@@ -11,7 +16,9 @@ import { gbrainPath } from './config.ts';
 import {
   importImageFileWithBoundedOcrText,
   isImageFilePath,
+  MAX_IMAGE_BYTES,
   prepareBoundedImageOcrInput,
+  type BoundedImageOcrExpectedPageState,
 } from './import-file.ts';
 import type { ImageImportFenceToken } from './image-import-fence.ts';
 
@@ -24,6 +31,19 @@ export interface ImageOcrManifestEntry {
 
 export interface ValidatedImageOcrManifestEntry extends ImageOcrManifestEntry {
   registered_root: string;
+  registered_root_identity: ImageOcrFilesystemIdentity;
+  file_identity: ImageOcrFilesystemIdentity;
+  image_format: 'png' | 'jpeg' | 'gif' | 'webp' | 'heic' | 'avif';
+  image_width: number;
+  image_height: number;
+  image_pixels: number;
+  visual_tokens: number;
+  worst_case_usd: number;
+}
+
+export interface ImageOcrFilesystemIdentity {
+  device: number;
+  inode: number;
 }
 
 export interface ValidatedImageOcrManifest {
@@ -40,6 +60,16 @@ export interface ImageOcrRunReport {
   succeeded: number;
   failed: number;
   skipped: number;
+  reservations: number;
+  provider_attempts: number;
+  successful_provider_receipts: number;
+  observed_input_tokens: number;
+  observed_cache_creation_input_tokens: number;
+  observed_cache_read_input_tokens: number;
+  observed_output_tokens: number;
+  observed_usd: number;
+  persisted_imports: number;
+  failures: number;
   daily_calls_before: number | null;
   daily_calls_after: number | null;
   daily_usd_reserved_before: number | null;
@@ -79,6 +109,7 @@ export async function importValidatedImageOcrEntry(
   engine: BrainEngine,
   entry: ValidatedImageOcrManifestEntry,
   ocrText: string,
+  expectedPageState: BoundedImageOcrExpectedPageState,
   imageImportFenceToken: ImageImportFenceToken,
 ): Promise<void> {
   const result = await importImageFileWithBoundedOcrText(
@@ -89,6 +120,7 @@ export async function importValidatedImageOcrEntry(
     entry.registered_root,
     entry.sha256,
     ocrText,
+    expectedPageState,
     imageImportFenceToken,
   );
   if (result.status !== 'imported') throw new Error('Bounded image import did not complete');
@@ -96,6 +128,94 @@ export async function importValidatedImageOcrEntry(
 
 function hashBytes(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
+}
+
+function filesystemIdentity(stat: Stats): ImageOcrFilesystemIdentity {
+  return { device: stat.dev, inode: stat.ino };
+}
+
+function sameFilesystemIdentity(
+  left: ImageOcrFilesystemIdentity,
+  right: ImageOcrFilesystemIdentity,
+): boolean {
+  return left.device === right.device && left.inode === right.inode;
+}
+
+export function inspectImageOcrRegisteredRoot(path: string): {
+  canonicalPath: string;
+  identity: ImageOcrFilesystemIdentity;
+} {
+  const visiblePath = resolve(path);
+  const visible = lstatSync(visiblePath);
+  if (visible.isSymbolicLink()) throw new Error('Bounded image OCR registered source root may not be a symlink');
+  const canonicalPath = realpathSync(visiblePath);
+  const canonical = statSync(canonicalPath);
+  if (!canonical.isDirectory()) throw new Error('Bounded image OCR registered source root is not a directory');
+  return { canonicalPath, identity: filesystemIdentity(canonical) };
+}
+
+/**
+ * Reopen through a no-follow descriptor and bind the pathname, descriptor,
+ * source containment, filesystem identity, size, and SHA to one exact buffer.
+ */
+export function readImageOcrSourceFile(input: {
+  filePath: string;
+  imageSlug: string;
+  registeredRoot: string;
+  expectedHash: string;
+  expectedFileIdentity: ImageOcrFilesystemIdentity;
+}): Buffer {
+  if (lstatSync(input.filePath).isSymbolicLink()) {
+    throw new Error('Bounded image OCR file may not be a symlink');
+  }
+  const noFollow = typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0;
+  const fd = openSync(input.filePath, fsConstants.O_RDONLY | noFollow);
+  try {
+    const before = fstatSync(fd);
+    const beforeIdentity = filesystemIdentity(before);
+    if (!before.isFile() || !sameFilesystemIdentity(beforeIdentity, input.expectedFileIdentity)) {
+      throw new Error('Bounded image OCR file identity changed after manifest validation');
+    }
+    if (before.size > MAX_IMAGE_BYTES) {
+      throw new Error(`Bounded image OCR file exceeds ${MAX_IMAGE_BYTES} bytes`);
+    }
+
+    const realRoot = realpathSync(input.registeredRoot);
+    if (realRoot !== input.registeredRoot) {
+      throw new Error('Bounded image OCR registered source root is no longer canonical');
+    }
+    const realFile = realpathSync(input.filePath);
+    const realRelative = canonicalRelativePath(realRoot, realFile);
+    if (realRelative.toLowerCase() !== input.imageSlug) {
+      throw new Error('Bounded image OCR file is no longer inside its registered source root');
+    }
+    const pathBefore = statSync(input.filePath);
+    if (!sameFilesystemIdentity(filesystemIdentity(pathBefore), beforeIdentity)) {
+      throw new Error('Bounded image OCR pathname no longer identifies the opened file');
+    }
+
+    const bytes = readFileSync(fd);
+    const after = fstatSync(fd);
+    const pathAfter = statSync(input.filePath);
+    const realFileAfter = realpathSync(input.filePath);
+    if (
+      !sameFilesystemIdentity(filesystemIdentity(after), beforeIdentity)
+      || !sameFilesystemIdentity(filesystemIdentity(pathAfter), beforeIdentity)
+      || after.size !== before.size
+      || after.mtimeMs !== before.mtimeMs
+      || after.ctimeMs !== before.ctimeMs
+      || realFileAfter !== realFile
+      || bytes.length !== before.size
+    ) {
+      throw new Error('Bounded image OCR file changed while it was being read');
+    }
+    if (hashBytes(bytes) !== input.expectedHash) {
+      throw new Error('Bounded image OCR file hash changed after manifest validation');
+    }
+    return bytes;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function canonicalRelativePath(root: string, filePath: string): string {
@@ -185,9 +305,10 @@ export async function parseAndValidateImageOcrManifest(
       }
       if (!statSync(entry.file_path).isFile()) throw new Error(`Manifest line ${i + 1} file_path is not a file`);
       const visibleRoot = resolve(source.local_path);
+      const rootSnapshot = inspectImageOcrRegisteredRoot(source.local_path);
       const visibleRel = canonicalRelativePath(visibleRoot, entry.file_path);
       const realFile = realpathSync(entry.file_path);
-      const realRoot = realpathSync(source.local_path);
+      const realRoot = rootSnapshot.canonicalPath;
       const realRel = canonicalRelativePath(realRoot, realFile);
       if (visibleRel !== realRel) throw new Error(`Manifest line ${i + 1} source/file path normalization is ambiguous`);
       const canonicalSlug = visibleRel.toLowerCase();
@@ -197,20 +318,38 @@ export async function parseAndValidateImageOcrManifest(
       if (!isImageFilePath(entry.file_path) || !isImageFilePath(entry.slug)) {
         throw new Error(`Manifest line ${i + 1} is not a supported image type`);
       }
-      const actualHash = hashBytes(readFileSync(entry.file_path));
-      if (actualHash !== entry.sha256) throw new Error(`Manifest line ${i + 1} sha256 mismatch`);
+      const fileIdentity = filesystemIdentity(statSync(realFile));
+      const sourceBytes = readImageOcrSourceFile({
+        filePath: entry.file_path,
+        imageSlug: entry.slug,
+        registeredRoot: realRoot,
+        expectedHash: entry.sha256,
+        expectedFileIdentity: fileIdentity,
+      });
       const existing = await engine.getPage(entry.slug, { sourceId: entry.source_id });
       if (existing?.content_hash === entry.sha256) {
         throw new Error(`Manifest line ${i + 1} is already imported with the same hash`);
       }
       // Decode and validate the exact provider payload before acquiring budget.
-      await prepareBoundedImageOcrInput(
+      const prepared = await prepareBoundedImageOcrInput(
         entry.file_path,
         entry.slug,
-        visibleRoot,
+        realRoot,
         entry.sha256,
+        sourceBytes,
       );
-      entries.push(Object.freeze({ ...entry, registered_root: visibleRoot }));
+      entries.push(Object.freeze({
+        ...entry,
+        registered_root: realRoot,
+        registered_root_identity: Object.freeze({ ...rootSnapshot.identity }),
+        file_identity: Object.freeze({ ...fileIdentity }),
+        image_format: prepared.info.format,
+        image_width: prepared.info.width,
+        image_height: prepared.info.height,
+        image_pixels: prepared.info.pixels,
+        visual_tokens: prepared.info.visualTokens,
+        worst_case_usd: prepared.info.worstCaseUsd,
+      }));
     } catch {
       throw new ImageOcrManifestError(i, sourceId, slug);
     }
