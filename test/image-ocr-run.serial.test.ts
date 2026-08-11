@@ -1375,6 +1375,49 @@ describe('bounded run behavior', () => {
     expect(JSON.stringify(audit)).not.toContain('MUST NOT PERSIST');
   });
 
+  test('an over-reservation provider observation consumes same-day USD capacity before a later run', async () => {
+    const f = fixture();
+    const state = statefulImageEngine(f.root);
+    f.engine = state.engine;
+    const caps = { maxImages: 2, maxUsd: 0.02, reserveUsdPerCall: 0.01 };
+    let providerCalls = 0;
+
+    const first = await runCommand(f, caps, {
+      ocrProvider: async () => {
+        providerCalls++;
+        return injectedReceiptWithUsage(20_000, 0, 'MUST NOT PERSIST');
+      },
+    });
+    expect(first).toMatchObject({ status: 'failed' });
+    expect(providerCalls).toBe(1);
+
+    const second = await runCommand(f, caps, {
+      ocrProvider: async () => {
+        providerCalls++;
+        return injectedReceipt('MUST NOT RUN');
+      },
+    });
+
+    expect(providerCalls).toBe(1);
+    expect(second).toMatchObject({
+      status: 'cap_reached',
+      processed: 0,
+      succeeded: 0,
+      skipped: 1,
+      daily_calls_before: 1,
+      daily_calls_after: 1,
+      daily_usd_reserved_before: 0.02,
+      daily_usd_reserved_after: 0.02,
+      first_failing_entry: { index: 0, code: 'usd_cap' },
+    });
+    expect(state.pages.size).toBe(0);
+    expect(state.chunks.size).toBe(0);
+    expect(JSON.parse(readFileSync(join(f.ledgerDir, '2026-08-10.json'), 'utf8'))).toMatchObject({
+      calls_reserved: 1,
+      usd_reserved_micros: 20_000,
+    });
+  });
+
   test('native fetch rejects redirects without sending the OCR request to the redirect target', async () => {
     const paths: string[] = [];
     const server = createServer((request, response) => {

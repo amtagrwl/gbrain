@@ -510,7 +510,10 @@ function parseLedger(path: string, expectedDate: string): LedgerFile {
     : [];
   const auditValid = Array.isArray(parsed.audit) && normalizedAudit.every(entry => entry !== null);
   const audit = auditValid ? normalizedAudit as LedgerAuditEntry[] : [];
-  const auditUsd = audit.reduce((sum, entry) => sum + entry.reserved_usd_micros, 0);
+  const auditUsd = audit.reduce((sum, entry) => sum + Math.max(
+    entry.reserved_usd_micros,
+    entry.invalid_provider_observation?.actual_usd_micros ?? 0,
+  ), 0);
   if (
     parsed.schema_version !== 2
     || parsed.utc_date !== expectedDate
@@ -797,7 +800,11 @@ export class OcrBudgetLedger {
     if (index < 0) throw new Error('Image OCR reservation is not present in the held ledger');
     const audit = [...this.ledger.audit];
     audit[index] = update(audit[index]);
-    this.ledger = { ...this.ledger, audit };
+    const usdReservedMicros = audit.reduce((sum, entry) => sum + Math.max(
+      entry.reserved_usd_micros,
+      entry.invalid_provider_observation?.actual_usd_micros ?? 0,
+    ), 0);
+    this.ledger = { ...this.ledger, usd_reserved_micros: usdReservedMicros, audit };
     writeLedgerDurably(this.ledgerPath, this.ledger);
   }
 
