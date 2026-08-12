@@ -45,7 +45,8 @@ import {
 } from '../core/image-import-fence.ts';
 
 const HELP = `Usage: gbrain image-ocr-run <manifest.jsonl> \\
-  --max-images N --max-usd USD --reserve-usd-per-call USD --yes
+  --max-images N --max-usd USD --reserve-usd-per-call USD --yes \\
+  [--recurring-strict-absence]
 
 Runs paid image OCR only for the exact, prevalidated JSONL entries. All caps
 are mandatory and shared with prior runs on the same UTC date. --yes is an
@@ -55,6 +56,7 @@ explicit non-interactive confirmation; no env-only override exists.
 export interface ImageOcrRunArgs extends ImageOcrCaps {
   manifestPath: string;
   yes: true;
+  recurringStrictAbsence: boolean;
 }
 
 function flagValue(args: string[], name: string): string | undefined {
@@ -81,7 +83,10 @@ function manifestHashBestEffort(path: string | undefined): string | null {
 }
 
 export function parseImageOcrRunArgs(args: string[]): ImageOcrRunArgs {
-  const allowed = new Set(['--max-images', '--max-usd', '--reserve-usd-per-call', '--yes']);
+  const allowed = new Set([
+    '--max-images', '--max-usd', '--reserve-usd-per-call', '--yes',
+    '--recurring-strict-absence',
+  ]);
   for (const arg of args) {
     if (arg.startsWith('--') && !allowed.has(arg.split('=', 1)[0])) {
       throw new Error(`Unknown image-ocr-run flag: ${arg}`);
@@ -100,13 +105,20 @@ export function parseImageOcrRunArgs(args: string[]): ImageOcrRunArgs {
     maxUsd: parseRequiredNumber(args, '--max-usd'),
     reserveUsdPerCall: parseRequiredNumber(args, '--reserve-usd-per-call'),
   });
-  return { manifestPath: positionals[0], yes: true, ...caps };
+  return {
+    manifestPath: positionals[0],
+    yes: true,
+    recurringStrictAbsence: args.includes('--recurring-strict-absence'),
+    ...caps,
+  };
 }
 
 const IMAGE_OCR_RAW_VALUE_FLAGS = new Set([
   '--brain', '--max-images', '--max-usd', '--reserve-usd-per-call',
 ]);
-const IMAGE_OCR_RAW_BOOLEAN_FLAGS = new Set(['--help', '--yes']);
+const IMAGE_OCR_RAW_BOOLEAN_FLAGS = new Set([
+  '--help', '--yes', '--recurring-strict-absence',
+]);
 
 /** Strict full-argv gate run before cli.ts strips global flags. */
 export function validateImageOcrRunRawArgv(rawArgv: string[]): string | null {
@@ -232,6 +244,83 @@ export interface ImageOcrCommandOptions {
     mime: string,
   ) => Promise<BoundedImageOcrReceipt>;
   imageImportFenceRoot?: string;
+}
+
+interface RecurringStrictAbsenceCounts {
+  target_page_count: number | string;
+  quality_donor_count: number | string;
+  global_hash_page_count: number | string;
+  file_row_count: number | string;
+}
+
+function strictZeroCount(value: number | string): boolean {
+  return value === 0 || value === '0';
+}
+
+/** Re-prove recurring-only absence predicates under the shared import fence. */
+async function revalidateRecurringStrictAbsence(
+  engine: BrainEngine,
+  entry: ValidatedImageOcrManifestEntry,
+): Promise<void> {
+  const currentSource = (await engine.listAllSources({ includeArchived: false }))
+    .find(source => source.id === entry.source_id);
+  if (!currentSource?.local_path) throw new Error('Recurring OCR source disappeared');
+  const currentRoot = inspectImageOcrRegisteredRoot(currentSource.local_path);
+  if (
+    currentRoot.canonicalPath !== entry.registered_root
+    || currentRoot.identity.device !== entry.registered_root_identity.device
+    || currentRoot.identity.inode !== entry.registered_root_identity.inode
+  ) {
+    throw new Error('Recurring OCR source root changed');
+  }
+  readImageOcrSourceFile({
+    filePath: entry.file_path,
+    imageSlug: entry.slug,
+    registeredRoot: entry.registered_root,
+    expectedHash: entry.sha256,
+    expectedFileIdentity: entry.file_identity,
+  });
+
+  const rows = await engine.executeRaw<RecurringStrictAbsenceCounts>(
+    `SELECT
+       (SELECT count(*) FROM pages target
+         WHERE target.source_id = $1 AND target.slug = $2) AS target_page_count,
+       (SELECT count(*)
+          FROM pages p
+          JOIN content_chunks cc ON cc.page_id = p.id
+         WHERE p.deleted_at IS NULL
+           AND p.page_kind = 'image'
+           AND p.content_hash = $3
+           AND (p.contextual_retrieval_mode IS NULL OR p.contextual_retrieval_mode = 'none')
+           AND p.corpus_generation IS NULL
+           AND cc.chunk_index = 0
+           AND cc.chunk_source = 'image_asset'
+           AND cc.modality = 'image'
+           AND cc.chunk_text = p.compiled_truth
+           AND length(p.compiled_truth) >= 120
+           AND btrim(p.compiled_truth) <> ''
+           AND p.compiled_truth ~ '[[:alnum:]]'
+           AND cc.embedding IS NOT NULL
+           AND btrim(cc.model) <> ''
+           AND vector_dims(cc.embedding) > 0
+           AND (cc.token_count IS NULL OR cc.token_count >= 0)
+           AND (p.embedding_signature IS NULL
+                OR p.embedding_signature = cc.model || ':' || vector_dims(cc.embedding)::text)
+           AND (SELECT count(*) FROM content_chunks one_chunk WHERE one_chunk.page_id = p.id) = 1
+       ) AS quality_donor_count,
+       (SELECT count(*) FROM pages hashed WHERE hashed.content_hash = $3) AS global_hash_page_count,
+       (SELECT count(*) FROM files stored WHERE stored.storage_path = $2) AS file_row_count`,
+    [entry.source_id, entry.slug, entry.sha256],
+  );
+  if (
+    rows.length !== 1
+    || !strictZeroCount(rows[0].target_page_count)
+    || !strictZeroCount(rows[0].quality_donor_count)
+    || !strictZeroCount(rows[0].global_hash_page_count)
+    || !strictZeroCount(rows[0].file_row_count)
+  ) {
+    throw new Error('Recurring OCR strict absence predicate changed');
+  }
 }
 
 type ImageOcrLifecycleState =
@@ -430,6 +519,7 @@ async function executeConfirmedImageOcrRun(input: {
   afterReserve?: ImageOcrCommandOptions['afterReserve'];
   importEntry: NonNullable<ImageOcrCommandOptions['importEntry']>;
   imageImportFenceRoot?: string;
+  recurringStrictAbsence: boolean;
 }): Promise<ImageOcrRunReport> {
   const caps = validateImageOcrCaps(input.caps);
   let processed = 0;
@@ -552,6 +642,9 @@ async function executeConfirmedImageOcrRun(input: {
           }
 
           try {
+            if (input.recurringStrictAbsence) {
+              await revalidateRecurringStrictAbsence(input.engine, entry);
+            }
             // The clock and date-ledger reservation intentionally happen while
             // the shared import fence is held. The adapter then performs the
             // required post-reservation source/page/file revalidation.
@@ -818,6 +911,7 @@ export async function runImageOcrRun(
       fallbackNow: now,
       afterReserve: options.afterReserve,
       imageImportFenceRoot: options.imageImportFenceRoot,
+      recurringStrictAbsence: parsed.recurringStrictAbsence,
       importEntry: options.importEntry
         ?? (async (entry, beforeProviderAttempt, fenceToken, lifecycle) => {
           try {

@@ -307,6 +307,13 @@ function commandArgs(f: ReturnType<typeof fixture>, caps = { maxImages: 1, maxUs
   ];
 }
 
+function recurringStrictCommandArgs(
+  f: ReturnType<typeof fixture>,
+  caps = { maxImages: 1, maxUsd: 1, reserveUsdPerCall: 0.01 },
+) {
+  return [...commandArgs(f, caps), '--recurring-strict-absence'];
+}
+
 async function runCommand(
   f: ReturnType<typeof fixture>,
   caps = { maxImages: 1, maxUsd: 1, reserveUsdPerCall: 0.01 },
@@ -321,6 +328,53 @@ async function runCommand(
       now: UTC_DAY_1,
       ...options,
     });
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+}
+
+async function runRecurringStrictCommand(
+  f: ReturnType<typeof fixture>,
+  strictCounts: Partial<{
+    target_page_count: number;
+    quality_donor_count: number;
+    global_hash_page_count: number;
+    file_row_count: number;
+  }> = {},
+) {
+  let providerCalls = 0;
+  let mutations = 0;
+  let strictSql = '';
+  f.engine = {
+    ...f.engine,
+    executeRaw: async (sql: string) => {
+      strictSql = sql;
+      return [{
+        target_page_count: 0,
+        quality_donor_count: 0,
+        global_hash_page_count: 0,
+        file_row_count: 0,
+        ...strictCounts,
+      }];
+    },
+  } as unknown as BrainEngine;
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (() => true) as typeof process.stdout.write;
+  try {
+    const report = await runImageOcrRun(f.engine, recurringStrictCommandArgs(f), {
+      ledgerDirectory: f.ledgerDir,
+      imageImportFenceRoot: join(f.ledgerDir, 'image-import-fence'),
+      now: UTC_DAY_1,
+      importEntry: async (_entry, beforeProviderAttempt, _fenceToken, lifecycle) => {
+        await beforeProviderAttempt();
+        providerCalls++;
+        lifecycle.recordTransportAttempt();
+        lifecycle.recordProviderReceipt(injectedReceipt());
+        mutations++;
+        lifecycle.recordPersistenceSuccess();
+      },
+    });
+    return { report, providerCalls, mutations, strictSql };
   } finally {
     process.stdout.write = originalWrite;
   }
@@ -431,6 +485,17 @@ describe('cap parsing and policy ceilings', () => {
     ])).toThrow(/Unknown/);
   });
 
+  test('accepts only the explicit recurring strict-absence contract flag', () => {
+    const f = fixture();
+    expect(parseImageOcrRunArgs(recurringStrictCommandArgs(f))).toMatchObject({
+      manifestPath: f.manifestPath,
+      recurringStrictAbsence: true,
+    });
+    expect(validateImageOcrRunRawArgv([
+      '--brain', 'host', 'image-ocr-run', ...recurringStrictCommandArgs(f),
+    ])).toBeNull();
+  });
+
   test('rejects zero, negative, non-finite, and policy-loosening values', () => {
     const invalid = [
       { maxImages: 0, maxUsd: 1, reserveUsdPerCall: 0.01 },
@@ -446,6 +511,46 @@ describe('cap parsing and policy ceilings', () => {
     for (const caps of invalid) expect(() => validateImageOcrCaps(caps)).toThrow();
     expect(validateImageOcrCaps({ maxImages: 1000, maxUsd: 10, reserveUsdPerCall: 0.01 }))
       .toEqual({ maxImages: 1000, maxUsd: 10, reserveUsdPerCall: 0.01 });
+  });
+});
+
+describe('recurring strict absence provider boundary', () => {
+  test.each([
+    ['soft-deleted target key', { target_page_count: 1 }],
+    ['different-hash target created after wrapper classification', { target_page_count: 1 }],
+    ['qualifying exact-hash quality donor', { quality_donor_count: 1 }],
+    ['global hash collision', { global_hash_page_count: 1 }],
+    ['global files.storage_path collision', { file_row_count: 1 }],
+  ] as const)('%s stops before reservation, provider, or mutation', async (_name, counts) => {
+    const f = fixture();
+    const result = await runRecurringStrictCommand(f, counts);
+    expect(result.report).toMatchObject({
+      reservations: 0,
+      provider_attempts: 0,
+      persisted_imports: 0,
+      status: 'rejected',
+      terminal_error: 'run_rejected',
+    });
+    expect(result.providerCalls).toBe(0);
+    expect(result.mutations).toBe(0);
+    expect(readdirSync(f.ledgerDir).filter(name => name.endsWith('.json'))).toEqual([]);
+  });
+
+  test('re-proves exact target, deterministic min-120 donor, global hash, and file absence', async () => {
+    const f = fixture();
+    const result = await runRecurringStrictCommand(f);
+    expect(result.report).toMatchObject({ status: 'completed', reservations: 1, provider_attempts: 1 });
+    expect(result.strictSql).toContain('p.deleted_at IS NULL');
+    expect(result.strictSql).toContain("p.page_kind = 'image'");
+    expect(result.strictSql).toContain("cc.chunk_source = 'image_asset'");
+    expect(result.strictSql).toContain("cc.modality = 'image'");
+    expect(result.strictSql).toContain('length(p.compiled_truth) >= 120');
+    expect(result.strictSql).toContain('cc.embedding IS NOT NULL');
+    expect(result.strictSql).toContain('vector_dims(cc.embedding) > 0');
+    expect(result.strictSql).toContain('vector_dims(cc.embedding)');
+    expect(result.strictSql).toContain('FROM files');
+    expect(result.providerCalls).toBe(1);
+    expect(result.mutations).toBe(1);
   });
 });
 
@@ -2032,7 +2137,8 @@ test('command source contains no broad lifecycle lane', () => {
 
 test('safety-critical CLI flag registry is an exact narrow allowlist', () => {
   expect(CLI_FLAG_REGISTRY['image-ocr-run']).toEqual([
-    '--brain', '--help', '--max-images', '--max-usd', '--reserve-usd-per-call', '--yes',
+    '--brain', '--help', '--max-images', '--max-usd', '--recurring-strict-absence',
+    '--reserve-usd-per-call', '--yes',
   ]);
   expect(CLI_FLAG_REGISTRY['image-ocr-run']).not.toContain('--full');
   expect(CLI_FLAG_REGISTRY['image-ocr-run']).not.toContain('--all');

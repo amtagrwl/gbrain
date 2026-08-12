@@ -38,7 +38,7 @@ const EXTRA_FLAGS: Record<string, string[]> = {
 
 /** Spend/security boundaries whose legal surface must not inherit prose flags. */
 const EXACT_FLAGS: Record<string, string[]> = {
-  'image-ocr-run': ['--brain', '--help', '--max-images', '--max-usd', '--reserve-usd-per-call', '--yes'],
+  'image-ocr-run': ['--brain', '--help', '--max-images', '--max-usd', '--recurring-strict-absence', '--reserve-usd-per-call', '--yes'],
   'image-donor-adopt': ['--brain', '--help', '--max-images', '--yes'],
 };
 
