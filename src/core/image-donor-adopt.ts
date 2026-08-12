@@ -495,6 +495,18 @@ function targetMatchesDonor(
     && Number(counts.code_edges_symbol) === 0;
 }
 
+function targetStateForIdempotentReplay(
+  state: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    ...state,
+    page: {
+      ...state.page as Record<string, unknown>,
+      last_retrieved_at: null,
+    },
+  };
+}
+
 async function exactPriorAdoption(
   tx: BrainEngine,
   target: ExactHashDonorTarget,
@@ -540,8 +552,10 @@ async function exactPriorAdoption(
     || exactHashStateDigest(file) !== provenance.file_poststate_sha256
   ) return null;
   const state = await readExactTargetState(tx, safeInteger(existingPage.id), targetChunkId, true);
-  if (!state || !targetMatchesDonor(state, target, donor, file, fileDisposition)) return null;
-  const page = state.page as Record<string, unknown>;
+  if (!state) return null;
+  const replayState = targetStateForIdempotentReplay(state);
+  if (!targetMatchesDonor(replayState, target, donor, file, fileDisposition)) return null;
+  const page = replayState.page as Record<string, unknown>;
   const receipt = finalizeReceipt({
     policy_version: IMAGE_DONOR_ADOPTION_POLICY_VERSION,
     manifest_hash: target.manifestHash,
@@ -560,7 +574,7 @@ async function exactPriorAdoption(
     target_page_id: safeInteger(existingPage.id),
     target_chunk_id: targetChunkId,
     target_generation: safeInteger(page.generation),
-    target_poststate_sha256: exactHashStateDigest(state),
+    target_poststate_sha256: exactHashStateDigest(replayState),
     file_id: safeInteger(file.id),
     file_disposition: fileDisposition,
     file_poststate_sha256: exactHashStateDigest(file),

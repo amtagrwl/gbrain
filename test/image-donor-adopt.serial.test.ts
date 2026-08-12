@@ -779,6 +779,46 @@ describe('exact-hash donor qualification and adoption transaction', () => {
     await expect(adopt(frontmatter)).rejects.toBeInstanceOf(ExactHashDonorTargetConflictError);
   });
 
+  test('replays exact adoption after get retrieval telemetry without rebasing rollback CAS', async () => {
+    const f = await fixture('idempotent-after-get');
+    await seedDonor(f.hash);
+    const first = await adopt(f);
+    expect(first.status).toBe('adopted');
+    if (first.status !== 'adopted') return;
+
+    await engine.executeRaw(
+      `UPDATE pages
+          SET last_retrieved_at='2026-08-12T04:29:09.344Z'::timestamptz
+        WHERE id=$1`,
+      [first.receipt.target_page_id],
+    );
+    const telemetry = await engine.executeRaw<Record<string, unknown>>(
+      `SELECT last_retrieved_at, salience_touched_at,
+              updated_at = created_at AS timestamps_unchanged
+         FROM pages WHERE id=$1`,
+      [first.receipt.target_page_id],
+    );
+    expect(telemetry[0]?.last_retrieved_at).not.toBeNull();
+    expect(telemetry[0]?.salience_touched_at).toBeNull();
+    expect(telemetry[0]?.timestamps_unchanged).toBe(true);
+
+    const replay = await adopt(f);
+    expect(replay.status).toBe('idempotent');
+    if (replay.status !== 'idempotent') return;
+    const { status: _status, ...replayReceipt } = replay;
+    expect(replayReceipt).toEqual(first.receipt);
+    const replayTelemetry = await engine.executeRaw<Record<string, unknown>>(
+      `SELECT last_retrieved_at FROM pages WHERE id=$1`,
+      [first.receipt.target_page_id],
+    );
+    expect(dateText(replayTelemetry[0]?.last_retrieved_at)).toBe('2026-08-12T04:29:09.344Z');
+    await expect(withImageImportFence(
+      token => rollbackImageFileExactHashDonor(engine, replayReceipt, token),
+      { lockRoot: fenceRoot },
+    )).rejects.toBeInstanceOf(ExactHashDonorRollbackConflictError);
+    expect(await engine.getPage(f.slug, { sourceId: f.sourceId })).not.toBeNull();
+  });
+
   test('creates, preserves, or rejects the global files row without unsafe ownership rewrites', async () => {
     const f = await fixture('files-created');
     await seedDonor(f.hash);
