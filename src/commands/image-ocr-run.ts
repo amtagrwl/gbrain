@@ -247,14 +247,14 @@ export interface ImageOcrCommandOptions {
 }
 
 interface RecurringStrictAbsenceCounts {
-  target_page_count: number | string;
-  quality_donor_count: number | string;
-  global_hash_page_count: number | string;
-  file_row_count: number | string;
+  target_page_count: number | string | bigint;
+  quality_donor_count: number | string | bigint;
+  global_hash_page_count: number | string | bigint;
+  file_row_count: number | string | bigint;
 }
 
-function strictZeroCount(value: number | string): boolean {
-  return value === 0 || value === '0';
+function strictZeroCount(value: number | string | bigint): boolean {
+  return value === 0 || value === '0' || value === 0n;
 }
 
 /** Re-prove recurring-only absence predicates under the shared import fence. */

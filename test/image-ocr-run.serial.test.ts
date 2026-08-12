@@ -536,6 +536,40 @@ describe('recurring strict absence provider boundary', () => {
     expect(readdirSync(f.ledgerDir).filter(name => name.endsWith('.json'))).toEqual([]);
   });
 
+  test('accepts PostgreSQL bigint zero counts at the recurring boundary', async () => {
+    const f = fixture();
+    let providerCalls = 0;
+    f.engine = {
+      ...f.engine,
+      executeRaw: async () => [{
+        target_page_count: 0n,
+        quality_donor_count: 0n,
+        global_hash_page_count: 0n,
+        file_row_count: 0n,
+      }],
+    } as unknown as BrainEngine;
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (() => true) as typeof process.stdout.write;
+    try {
+      const report = await runImageOcrRun(f.engine, recurringStrictCommandArgs(f), {
+        ledgerDirectory: f.ledgerDir,
+        imageImportFenceRoot: join(f.ledgerDir, 'image-import-fence'),
+        now: UTC_DAY_1,
+        importEntry: async (_entry, beforeProviderAttempt, _fenceToken, lifecycle) => {
+          await beforeProviderAttempt();
+          providerCalls++;
+          lifecycle.recordTransportAttempt();
+          lifecycle.recordProviderReceipt(injectedReceipt());
+          lifecycle.recordPersistenceSuccess();
+        },
+      });
+      expect(report).toMatchObject({ status: 'completed', reservations: 1, provider_attempts: 1 });
+      expect(providerCalls).toBe(1);
+    } finally {
+      process.stdout.write = originalWrite;
+    }
+  });
+
   test('re-proves exact target, deterministic min-120 donor, global hash, and file absence', async () => {
     const f = fixture();
     const result = await runRecurringStrictCommand(f);
