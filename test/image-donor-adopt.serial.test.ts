@@ -901,6 +901,28 @@ describe('exact-hash donor qualification and adoption transaction', () => {
     expect(await engine.getPage(racedDifferent.slug, { sourceId: racedDifferent.sourceId, includeDeleted: true })).toBeNull();
   });
 
+  test('refuses pre-existing dangling aliases before target adoption', async () => {
+    const f = await fixture('pre-existing-alias');
+    const donor = await seedDonor(f.hash);
+    const donorPageBefore = await pageState(donor.pageId);
+    const donorChunkBefore = await chunkState(donor.chunkId);
+    await engine.executeRaw(
+      `INSERT INTO page_aliases (source_id, alias_norm, slug)
+       VALUES ($1, 'target alias', $2)`,
+      [f.sourceId, f.slug],
+    );
+
+    await expect(adopt(f)).rejects.toBeInstanceOf(ExactHashDonorTargetConflictError);
+    expect(await engine.getPage(f.slug, { sourceId: f.sourceId, includeDeleted: true })).toBeNull();
+    expect(await fileState(f.slug)).toBeNull();
+    expect(await engine.executeRaw(
+      `SELECT alias_norm FROM page_aliases WHERE source_id=$1 AND slug=$2`,
+      [f.sourceId, f.slug],
+    )).toEqual([{ alias_norm: 'target alias' }]);
+    expect(await pageState(donor.pageId)).toEqual(donorPageBefore);
+    expect(await chunkState(donor.chunkId)).toEqual(donorChunkBefore);
+  });
+
   test('rolls back the whole row transaction on a post-write failure', async () => {
     const f = await fixture('tx-rollback');
     const donor = await seedDonor(f.hash);
@@ -968,6 +990,28 @@ describe('append-only receipt rollback contract', () => {
     const rolled = await rollback(adopted.receipt);
     expect(rolled.deleted_file_id).toBeNull();
     expect(await fileState(f.slug)).toEqual(before);
+  });
+
+  test('refuses rollback when an alias is inserted after adoption', async () => {
+    const f = await fixture('rollback-alias-drift');
+    await seedDonor(f.hash);
+    const adopted = await adopt(f);
+    expect(adopted.status).toBe('adopted');
+    if (adopted.status !== 'adopted') return;
+    await engine.executeRaw(
+      `INSERT INTO page_aliases (source_id, alias_norm, slug)
+       VALUES ($1, 'late alias', $2)`,
+      [f.sourceId, f.slug],
+    );
+
+    await expect(rollback(adopted.receipt))
+      .rejects.toBeInstanceOf(ExactHashDonorRollbackConflictError);
+    expect(await pageState(adopted.receipt.target_page_id)).not.toBeNull();
+    expect(await fileState(f.slug)).not.toBeNull();
+    expect(await engine.executeRaw(
+      `SELECT alias_norm FROM page_aliases WHERE source_id=$1 AND slug=$2`,
+      [f.sourceId, f.slug],
+    )).toEqual([{ alias_norm: 'late alias' }]);
   });
 
   test('refuses rollback after page, chunk, created-file, or dependent drift', async () => {

@@ -342,9 +342,10 @@ async function readExactTargetState(
        (SELECT count(*)::int FROM page_versions WHERE page_id=$1) AS versions,
        (SELECT count(*)::int FROM takes WHERE page_id=$1) AS takes,
        (SELECT count(*)::int FROM synthesis_evidence WHERE synthesis_page_id=$1) AS synthesis_evidence,
+       (SELECT count(*)::int FROM page_aliases WHERE source_id=$3 AND slug=$4) AS aliases,
        (SELECT count(*)::int FROM code_edges_chunk WHERE from_chunk_id=$2 OR to_chunk_id=$2) AS code_edges_chunk,
        (SELECT count(*)::int FROM code_edges_symbol WHERE from_chunk_id=$2) AS code_edges_symbol`,
-    [pageId, chunkId],
+    [pageId, chunkId, pages[0].source_id, pages[0].slug],
   );
   return { page: pages[0], chunk: chunks[0], related_counts: counts[0] };
 }
@@ -491,8 +492,24 @@ function targetMatchesDonor(
     && Number(counts.versions) === 0
     && Number(counts.takes) === 0
     && Number(counts.synthesis_evidence) === 0
+    && Number(counts.aliases) === 0
     && Number(counts.code_edges_chunk) === 0
     && Number(counts.code_edges_symbol) === 0;
+}
+
+async function lockAndCheckTargetAliases(
+  tx: BrainEngine,
+  sourceId: string,
+  slug: string,
+): Promise<void> {
+  await tx.executeRaw(`LOCK TABLE page_aliases IN SHARE MODE`);
+  const aliases = await tx.executeRaw<{ count: number }>(
+    `SELECT count(*)::int AS count
+       FROM page_aliases
+      WHERE source_id=$1 AND slug=$2`,
+    [sourceId, slug],
+  );
+  if (Number(aliases[0]?.count) !== 0) throw new ExactHashDonorTargetConflictError();
 }
 
 function targetStateForIdempotentReplay(
@@ -600,6 +617,8 @@ export async function importImageFileWithExactHashDonor(
       || !Number.isSafeInteger(Number(rawVersion))
       || Number(rawVersion) < IMAGE_DONOR_REQUIRED_SCHEMA_VERSION
     ) throw new ExactHashDonorSchemaVersionError();
+
+    await lockAndCheckTargetAliases(tx, target.sourceId, target.slug);
 
     const sources = await tx.executeRaw<{ local_path: string | null }>(
       `SELECT local_path FROM sources WHERE id=$1 FOR UPDATE`,
@@ -831,6 +850,7 @@ export async function rollbackImageFileExactHashDonor(
   assertImageImportFenceToken(imageImportFenceToken);
   validateReceipt(receipt);
   return engine.transaction(async (tx) => {
+    await tx.executeRaw(`LOCK TABLE page_aliases IN SHARE MODE`);
     const targetState = await readExactTargetState(
       tx,
       receipt.target_page_id,
