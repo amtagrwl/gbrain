@@ -164,12 +164,85 @@ The bounded OCR import stores OCR text without invoking multimodal embedding, so
 the command's dollar ledger covers its only provider request. Embedding remains a
 separate operation with its own provider and budget controls.
 
+## Exact-hash donor adoption (zero provider)
+
+Images whose source-local target does not exist can reuse trustworthy derived
+OCR/vector data from an active image page with the exact same physical SHA-256:
+
+```bash
+gbrain image-donor-adopt ./image-donor-manifest.jsonl \
+  --max-images 100 \
+  --yes
+```
+
+This is a separate storage-only command. It does not configure the AI gateway,
+construct an OCR request, read or reserve the OCR budget, call a model, or fall
+through to `image-ocr-run`. Its terminal JSON reports all provider, model,
+gateway, budget-reservation, and budget-USD counters as zero. It accepts only
+`--brain`, `--help`, `--max-images`, `--yes`, and one manifest positional;
+`--max-images` is mandatory and limited to 1 through 1,000. The entire manifest
+is preflighted before the first row transaction, including entries beyond the
+cap. A missing, malformed, or pre-v125 schema-version marker fails closed with
+`schema_incompatible`; this command never runs migrations.
+
+The donor command reuses the same exact-four-key JSONL, canonical registered
+root, containment, non-symlink, stable device/inode/size/mtime/ctime/SHA, image
+format, full-decode, frame, dimension, and pixel checks described above. It does
+not build the paid provider wire body. The registered source root and the exact
+file are checked again inside the shared image-import fence at both transaction
+boundaries.
+
+A qualifying donor is selected deterministically by page ID then chunk ID and
+is rebound under lock before copying. The page must be active,
+`page_kind='image'`, have the exact physical hash, and have exactly one chunk.
+That chunk must be index 0, `chunk_source='image_asset'`, `modality='image'`,
+contain a non-null text embedding with a nonblank model, and have text exactly
+equal to the page's `compiled_truth`. OCR text must be at least 120 characters,
+nonblank, and contain a letter or number. A non-null embedding signature must
+equal the chunk model plus the actual text-vector dimensions. Honest legacy
+NULLs for token count, embedded timestamp, signature, image vector, and
+multimodal vector remain NULL. Contextual vectors are reusable only when
+`contextual_retrieval_mode` is NULL/`none` and `corpus_generation` is NULL;
+title- or synopsis-conditioned vectors are rejected because they encode donor
+ownership context.
+
+Each attempted row runs in one transaction inside the fence. Any active or
+soft-deleted `(source_id, slug)` target is a conflict unless it is the exact,
+unchanged result of the same manifest adoption. A successful adoption creates
+fresh target page/chunk IDs and target-owned source/path/file metadata, copies
+only OCR and vector-derived values, creates no links, and stores versioned donor
+IDs plus image/OCR, donor-state, and text/image/multimodal-vector digests in
+namespaced target frontmatter. Exact replay checks those original digests, so a
+later coordinated re-embedding of donor and target is drift rather than a new
+idempotency baseline. The donor is never updated. Postconditions re-read the
+donor, target graph, and file row before commit.
+
+`files.storage_path` is globally unique, so the command handles it without the
+normal source-scoped upsert: absence creates a target-owned file row; an existing
+same-hash row is preserved byte-for-byte and reported as
+`preserved_existing`; an existing different-hash row aborts the row transaction.
+The deterministic report schema remains in manifest order, includes no wall
+clock, and binds run-specific database identities/digests plus the manifest hash,
+aggregate counts, first stable failure code, donor/file dispositions, and a
+full digest-only CAS receipt for every adopted or idempotent row. It never emits
+OCR text, vectors, credentials, provider configuration, or raw exception text.
+
+The receipt-backed rollback helper is deliberately compare-and-delete rather
+than a general migration framework. It refuses any target/chunk/file drift,
+including a new file-migration-ledger child, deletes a file only when that
+receipt created it, then deletes the target page (the chunk cascades), and never
+changes the donor or a pre-existing file row.
+Database sequences and the page-generation clock are monotonic and are not
+claimed to return to their prior values. There is no public bulk rollback CLI,
+scheduler integration, source rewrite, link reconciliation, or legacy-row
+retirement in this v0 path.
+
 ## Scope boundary
 
 This lane processes only manifest entries. It does not run sync, full scans,
 retry-failed, extraction, Dream, jobs, or all-source discovery beyond validating
 the source IDs named in the manifest.
 
-Exact-hash donor adoption is intentionally out of scope. Donor reuse is zero-model
-work and belongs in a separate migration. Prepare bounded-run manifests only for
-genuinely new images that have no exact-hash donor.
+Use paid `image-ocr-run` only when no qualifying exact-hash donor exists. Donor
+adoption never serves as authorization for paid OCR and cannot transition into
+the paid lane on failure.

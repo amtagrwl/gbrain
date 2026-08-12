@@ -44,7 +44,7 @@ if ! echo "$OUTPUT" | grep -q '"avif":{"ok":true'; then
   echo "Likely cause: the import attribute path for avif_dec.wasm changed in" >&2
   echo "@jsquash/avif, or initAvif() no longer accepts a WebAssembly.Module" >&2
   echo "directly. Check scripts/image-decoders-smoketest.ts for the WASM" >&2
-  echo "pre-init pattern, then mirror it in src/core/import-file.ts." >&2
+  echo "pre-init pattern, then mirror it in src/core/image-decode-impl.ts." >&2
   exit 1
 fi
 

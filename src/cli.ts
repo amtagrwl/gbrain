@@ -65,7 +65,7 @@ export function normalizeLocalResult(rawResult: unknown): unknown {
 }
 
 // CLI-only commands that bypass the operation layer
-export const CLI_ONLY = new Set(['init', 'reinit-pglite', 'pglite-repair', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'image-ocr-run', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'extract-conversation-facts', 'enrich', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'maintain', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'reconcile-links', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'calibration', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'ze-switch', 'retrieval-upgrade', 'founder', 'brainstorm', 'lsd', 'schema', 'capture', 'onboard', 'conversation-parser', 'status', 'connect', 'skillopt', 'quarantine', 'self-upgrade', 'protocol', 'advisor', 'watch', 'reindex-search-vector', 'pages', 'bench', 'backfill',
+export const CLI_ONLY = new Set(['init', 'reinit-pglite', 'pglite-repair', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'image-ocr-run', 'image-donor-adopt', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'extract-conversation-facts', 'enrich', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'maintain', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'reconcile-links', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'calibration', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'ze-switch', 'retrieval-upgrade', 'founder', 'brainstorm', 'lsd', 'schema', 'capture', 'onboard', 'conversation-parser', 'status', 'connect', 'skillopt', 'quarantine', 'self-upgrade', 'protocol', 'advisor', 'watch', 'reindex-search-vector', 'pages', 'bench', 'backfill',
   // v0.42.58 (#2035 class, caught by the handleCliOnly reachability sweep):
   // full handler at `case 'notability-eval'` but never dispatchable.
   'notability-eval']);
@@ -79,7 +79,7 @@ const CLI_ONLY_SELF_HELP = new Set([
   // `pages` had a live handleCliOnly case but was missing from CLI_ONLY
   // (the #2035 calibration bug class); `bench` was never wired at all.
   'pages', 'bench',
-  'embed', 'config', 'image-ocr-run',
+  'embed', 'config', 'image-ocr-run', 'image-donor-adopt',
   'skillpack', 'skillpack-check',
   'integrations', 'friction',
   'frontmatter', 'check-resolvable',
@@ -276,19 +276,19 @@ function maybeEmitUpdateMarker(command: string): void {
   }
 }
 
-export function rawArgvTargetsImageOcrRun(argv: string[]): boolean {
+function rawArgvTargetsStrictImageCommand(argv: string[], command: string): boolean {
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index];
-    if (arg === 'image-ocr-run') return true;
+    if (arg === command) return true;
     if (arg === '--quiet' || arg === '--progress-json' || arg === '--explain') continue;
     if (arg.startsWith('--brain=')) continue;
     if (arg === '--brain') {
-      if (argv[index + 1] === 'image-ocr-run') return true;
+      if (argv[index + 1] === command) return true;
       index++;
       continue;
     }
     if (arg === '--progress-interval') {
-      if (argv[index + 1] === 'image-ocr-run') return true;
+      if (argv[index + 1] === command) return true;
       const value = argv[index + 1];
       const parsed = value === undefined ? Number.NaN : Number(value);
       if (!Number.isFinite(parsed) || parsed < 0) return false;
@@ -301,7 +301,7 @@ export function rawArgvTargetsImageOcrRun(argv: string[]): boolean {
       continue;
     }
     if (arg === '--timeout') {
-      if (argv[index + 1] === 'image-ocr-run') return true;
+      if (argv[index + 1] === command) return true;
       const value = argv[index + 1];
       if (!value || !/^([0-9]+(?:\.[0-9]+)?)(ms|s|m)?$/.test(value)) return false;
       index++;
@@ -312,7 +312,33 @@ export function rawArgvTargetsImageOcrRun(argv: string[]): boolean {
       continue;
     }
     // parseGlobalFlags leaves unknown flags and the first plain token in place;
-    // either would become the command before a later image-ocr-run token.
+    // either would become the command before a later strict-command token.
+    return false;
+  }
+  return false;
+}
+
+export function rawArgvTargetsImageOcrRun(argv: string[]): boolean {
+  return rawArgvTargetsStrictImageCommand(argv, 'image-ocr-run');
+}
+
+export function rawArgvTargetsImageDonorAdopt(argv: string[]): boolean {
+  // Own malformed global-value failures too, so the donor lane still emits
+  // its single zero-spend JSON report before the generic parser can reinterpret
+  // `--timeout nope` (or an invalid --brain value) as the command.
+  const booleans = new Set(['--quiet', '--progress-json', '--explain']);
+  const values = new Set(['--brain', '--progress-interval', '--timeout']);
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index];
+    if (arg === 'image-donor-adopt') return true;
+    if (booleans.has(arg) || arg.startsWith('--brain=')) continue;
+    if (arg.startsWith('--progress-interval=') || arg.startsWith('--timeout=')) continue;
+    if (values.has(arg)) {
+      if (argv[index + 1] === 'image-donor-adopt') return true;
+      index++;
+      continue;
+    }
+    if (arg.startsWith('-')) continue;
     return false;
   }
   return false;
@@ -320,6 +346,19 @@ export function rawArgvTargetsImageOcrRun(argv: string[]): boolean {
 
 async function main() {
   const rawArgs = process.argv.slice(2);
+  if (rawArgvTargetsImageDonorAdopt(rawArgs)) {
+    const {
+      emitImageDonorAdoptTerminalFailure,
+      validateImageDonorAdoptRawArgv,
+    } = await import('./commands/image-donor-adopt.ts');
+    const invalid = validateImageDonorAdoptRawArgv(rawArgs);
+    if (invalid) {
+      emitImageDonorAdoptTerminalFailure(rawArgs, 'arguments_invalid');
+      console.error(`gbrain image-donor-adopt: disallowed or invalid raw argument ${invalid}`);
+      setCliExitVerdict(1);
+      return;
+    }
+  }
   if (rawArgvTargetsImageOcrRun(rawArgs)) {
     const {
       emitImageOcrRunTerminalFailure,
@@ -1545,7 +1584,7 @@ export function formatResult(
  * `runRemoteDoctor` for thin-client installs.
  */
 const THIN_CLIENT_REFUSED_COMMANDS = new Set([
-  'sync', 'embed', 'image-ocr-run', 'extract', 'extract-conversation-facts', 'enrich', 'migrate', 'retrieval-upgrade', 'apply-migrations',
+  'sync', 'embed', 'image-ocr-run', 'image-donor-adopt', 'extract', 'extract-conversation-facts', 'enrich', 'migrate', 'retrieval-upgrade', 'apply-migrations',
   'repair-jsonb', 'orphans', 'integrity', 'serve',
   // v0.43 (#2095): watch streams against a LOCAL engine; thin clients get
   // the volunteer_context MCP op instead.
@@ -1589,6 +1628,7 @@ const THIN_CLIENT_REFUSE_HINTS: Record<string, string> = {
   sync: 'sync runs on the host. Trigger a remote cycle with `gbrain remote ping` (queues an autopilot-cycle job).',
   embed: 'embed runs on the host as part of the autopilot cycle. `gbrain remote ping` triggers a full cycle including embed.',
   'image-ocr-run': 'image-ocr-run requires the host source registry, files, budget ledger, and local engine. Run it on the host machine.',
+  'image-donor-adopt': 'image-donor-adopt requires the host source registry, physical image files, and local storage engine. Run it on the host machine.',
   extract: 'extract runs on the host. Use `gbrain remote ping` to trigger a cycle including extract.',
   'extract-conversation-facts': 'extract-conversation-facts runs on the host (requires local engine + chat gateway). Run on the host machine.',
   enrich: 'enrich runs on the host (requires local engine + chat gateway for grounded synthesis). Run on the host machine.',
@@ -1643,6 +1683,11 @@ async function handleCliOnly(command: string, args: string[]) {
     await runImageOcrRun(null as never, args);
     return;
   }
+  if (command === 'image-donor-adopt' && args.includes('--help')) {
+    const { runImageDonorAdopt } = await import('./commands/image-donor-adopt.ts');
+    await runImageDonorAdopt(null as never, args);
+    return;
+  }
 
   // Thin-client guard: refuse DB-bound commands cleanly with a pinpoint
   // hint instead of letting them fail later inside connectEngine or
@@ -1651,6 +1696,13 @@ async function handleCliOnly(command: string, args: string[]) {
   if (THIN_CLIENT_REFUSED_COMMANDS.has(command)) {
     const cfg = loadConfig();
     if (isThinClient(cfg)) {
+      if (command === 'image-donor-adopt') {
+        const { emitImageDonorAdoptTerminalFailure } = await import('./commands/image-donor-adopt.ts');
+        emitImageDonorAdoptTerminalFailure(args, 'run_rejected');
+        console.error(THIN_CLIENT_REFUSE_HINTS['image-donor-adopt']);
+        setCliExitVerdict(1);
+        return;
+      }
       if (command === 'image-ocr-run') {
         const { emitImageOcrRunTerminalFailure } = await import('./commands/image-ocr-run.ts');
         emitImageOcrRunTerminalFailure(args, 'run_rejected');
@@ -2271,6 +2323,32 @@ async function handleCliOnly(command: string, args: string[]) {
     }
   }
 
+  // Donor adoption owns a storage-only connection seam: no gateway
+  // configuration, schema migration, paid transport, or spend ledger is
+  // initialized. Missing/outdated schema therefore fails closed in-command.
+  if (command === 'image-donor-adopt') {
+    let donorEngine: BrainEngine;
+    try {
+      donorEngine = await connectStorageOnlyEngine();
+    } catch (error) {
+      const { emitImageDonorAdoptTerminalFailure } = await import('./commands/image-donor-adopt.ts');
+      emitImageDonorAdoptTerminalFailure(args, 'run_rejected');
+      console.error(`gbrain image-donor-adopt: storage connection failed: ${error instanceof Error ? error.message : String(error)}`);
+      setCliExitVerdict(1);
+      return;
+    }
+    try {
+      const { runImageDonorAdopt } = await import('./commands/image-donor-adopt.ts');
+      const report = await runImageDonorAdopt(donorEngine, args);
+      if (report && report.status !== 'completed') {
+        setCliExitVerdict(1);
+      }
+    } finally {
+      await finishCliTeardown({ engine: donorEngine });
+    }
+    return;
+  }
+
   // Paid OCR owns a command-specific connection/reporting seam. Keeping this
   // before the generic switch ensures every failure emits exactly one JSON
   // report and prevents its narrow flag surface from bleeding into `jobs`
@@ -2883,6 +2961,19 @@ export { buildGatewayConfig };
 let activeBrainId: string = 'host';
 
 /**
+ * Connect without configuring the AI gateway or probing/applying migrations.
+ * This seam is intentionally exclusive to image-donor-adopt's raw SQL path.
+ */
+async function connectStorageOnlyEngine(): Promise<BrainEngine> {
+  const { resolveBrainId } = await import('./core/brain-resolver.ts');
+  const brainId = resolveBrainId(getCliOptions().brain);
+  const { loadRegistry } = await import('./core/brain-registry.ts');
+  const handle = await loadRegistry().getBrain(brainId);
+  activeBrainId = brainId;
+  return handle.engine;
+}
+
+/**
  * Connect to a mounted brain (brain axis, non-host). Routes through
  * BrainRegistry so:
  *   - an unknown/disabled mount id throws UnknownBrainError. Fail-closed:
@@ -3073,6 +3164,8 @@ SEARCH
 
 IMPORT/EXPORT
   import <dir> [--no-embed]          Import markdown directory
+  image-donor-adopt <manifest>       Reuse exact-hash image OCR/vector data
+                                     Run command --help for required bounds
   sync [--repo <path>] [flags]       Git-to-brain incremental sync
   sync --watch [--interval N]        Continuous sync (loops until stopped)
                                      See also: autopilot --install (continuous daemon).
