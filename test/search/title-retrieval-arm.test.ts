@@ -27,7 +27,10 @@ import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import { hybridSearch } from '../../src/core/search/hybrid.ts';
 import { buildOrFallbackWebsearchQuery } from '../../src/core/search/sql-ranking.ts';
-import { configureGateway } from '../../src/core/ai/gateway.ts';
+import {
+  __setEmbedTransportForTests,
+  configureGateway,
+} from '../../src/core/ai/gateway.ts';
 
 let engine: PGLiteEngine;
 
@@ -308,7 +311,9 @@ describe('hybridSearch wiring — title arm reaches the fused result set', () =>
       engine.searchTitles = originalTitles;
     }
 
-    expect(keywordFallbacks).toEqual([true, false]);
+    // Short query runs OR immediately. Long query starts strict, then this
+    // no-provider fixture lazily restores OR only on the degraded path.
+    expect(keywordFallbacks).toEqual([true, false, true]);
     expect(titleCalls).toBe(2);
   });
 
@@ -346,5 +351,207 @@ describe('hybridSearch wiring — title arm reaches the fused result set', () =>
     expect((await engine.searchKeyword(q, { limit: 5 })).length).toBe(0);
     const results = await hybridSearch(engine, q, { limit: 5 });
     expect(results.map(r => r.slug)).toContain('projects/chronomancer');
+  });
+
+  test('long body-only query recovers OR recall when no embedding provider is available', async () => {
+    await engine.putPage('notes/rollout', {
+      type: 'note',
+      title: 'Rollout Notes',
+      compiled_truth: 'emerald falcon pricing decision deferred to next planning cycle',
+    });
+    await engine.upsertChunks('notes/rollout', [
+      {
+        chunk_index: 0,
+        chunk_text: 'emerald falcon pricing decision deferred to next planning cycle',
+        chunk_source: 'compiled_truth',
+      },
+    ]);
+
+    const query = 'what did the emerald falcon pricing decision get postponed to';
+    expect((await engine.searchKeyword(query, { limit: 5 })).length).toBe(0);
+    const results = await hybridSearch(engine, query, { limit: 5 });
+    expect(results.map(r => r.slug)).toContain('notes/rollout');
+  });
+
+  test('long query does not run broad OR recovery when vector retrieval succeeds', async () => {
+    await engine.putPage('notes/vector-hit', {
+      type: 'note',
+      title: 'Vector Hit',
+      compiled_truth: 'a deterministic vector candidate',
+    });
+    await engine.upsertChunks('notes/vector-hit', [
+      {
+        chunk_index: 0,
+        chunk_text: 'a deterministic vector candidate',
+        chunk_source: 'compiled_truth',
+      },
+    ]);
+    const vectorHit = (await engine.searchKeyword('deterministic vector candidate', {
+      limit: 5,
+      orFallback: true,
+    }))[0]!;
+
+    const originalKeyword = engine.searchKeyword.bind(engine);
+    const originalVector = engine.searchVector.bind(engine);
+    const keywordFallbacks: Array<boolean | undefined> = [];
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: DIM,
+      env: { OPENAI_API_KEY: 'test-only' },
+    });
+    __setEmbedTransportForTests(async () => ({
+      embeddings: [new Array(DIM).fill(0.01)],
+      usage: { tokens: 1 },
+    } as any));
+    engine.searchKeyword = async (query, opts) => {
+      keywordFallbacks.push(opts?.orFallback);
+      return originalKeyword(query, opts);
+    };
+    engine.searchVector = async () => [vectorHit];
+
+    try {
+      const results = await hybridSearch(
+        engine,
+        'what did the emerald falcon pricing decision get postponed to',
+        { limit: 5 },
+      );
+      expect(results.map(r => r.slug)).toContain('notes/vector-hit');
+      expect(keywordFallbacks).toEqual([false]);
+    } finally {
+      engine.searchKeyword = originalKeyword;
+      engine.searchVector = originalVector;
+      __setEmbedTransportForTests(null);
+      configureGateway({
+        embedding_model: 'openai:text-embedding-3-large',
+        embedding_dimensions: DIM,
+        env: {},
+      });
+    }
+  });
+
+  test('long body-only query recovers OR recall when vector retrieval fails', async () => {
+    await engine.putPage('notes/vector-fallback', {
+      type: 'note',
+      title: 'Vector Fallback Notes',
+      compiled_truth: 'emerald falcon pricing decision deferred to next planning cycle',
+    });
+    await engine.upsertChunks('notes/vector-fallback', [
+      {
+        chunk_index: 0,
+        chunk_text: 'emerald falcon pricing decision deferred to next planning cycle',
+        chunk_source: 'compiled_truth',
+      },
+    ]);
+
+    const originalKeyword = engine.searchKeyword.bind(engine);
+    const originalVector = engine.searchVector.bind(engine);
+    const keywordFallbacks: Array<boolean | undefined> = [];
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: DIM,
+      env: { OPENAI_API_KEY: 'test-only' },
+    });
+    __setEmbedTransportForTests(async () => ({
+      embeddings: [new Array(DIM).fill(0.01)],
+      usage: { tokens: 1 },
+    } as any));
+    engine.searchKeyword = async (query, opts) => {
+      keywordFallbacks.push(opts?.orFallback);
+      return originalKeyword(query, opts);
+    };
+    engine.searchVector = async () => {
+      throw new Error('test vector failure');
+    };
+
+    try {
+      const results = await hybridSearch(
+        engine,
+        'what did the emerald falcon pricing decision get postponed to',
+        { limit: 5 },
+      );
+      expect(results.map(r => r.slug)).toContain('notes/vector-fallback');
+      expect(keywordFallbacks).toEqual([false, true]);
+    } finally {
+      engine.searchKeyword = originalKeyword;
+      engine.searchVector = originalVector;
+      __setEmbedTransportForTests(null);
+      configureGateway({
+        embedding_model: 'openai:text-embedding-3-large',
+        embedding_dimensions: DIM,
+        env: {},
+      });
+    }
+  });
+
+  test('long body-only query recovers OR recall when vector retrieval returns no candidates', async () => {
+    await engine.putPage('notes/vector-empty', {
+      type: 'note',
+      title: 'Vector Empty Notes',
+      compiled_truth: 'emerald falcon pricing decision deferred to next planning cycle',
+    });
+    await engine.upsertChunks('notes/vector-empty', [
+      {
+        chunk_index: 0,
+        chunk_text: 'emerald falcon pricing decision deferred to next planning cycle',
+        chunk_source: 'compiled_truth',
+      },
+    ]);
+
+    const originalKeyword = engine.searchKeyword.bind(engine);
+    const originalVector = engine.searchVector.bind(engine);
+    const keywordFallbacks: Array<boolean | undefined> = [];
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: DIM,
+      env: { OPENAI_API_KEY: 'test-only' },
+    });
+    __setEmbedTransportForTests(async () => ({
+      embeddings: [new Array(DIM).fill(0.01)],
+      usage: { tokens: 1 },
+    } as any));
+    engine.searchKeyword = async (query, opts) => {
+      keywordFallbacks.push(opts?.orFallback);
+      return originalKeyword(query, opts);
+    };
+    engine.searchVector = async () => [];
+
+    try {
+      const results = await hybridSearch(
+        engine,
+        'what did the emerald falcon pricing decision get postponed to',
+        { limit: 5 },
+      );
+      expect(results.map(r => r.slug)).toContain('notes/vector-empty');
+      expect(keywordFallbacks).toEqual([false, true]);
+    } finally {
+      engine.searchKeyword = originalKeyword;
+      engine.searchVector = originalVector;
+      __setEmbedTransportForTests(null);
+      configureGateway({
+        embedding_model: 'openai:text-embedding-3-large',
+        embedding_dimensions: DIM,
+        env: {},
+      });
+    }
+  });
+
+  test('image-only routing never resurrects text keyword recovery', async () => {
+    const originalKeyword = engine.searchKeyword.bind(engine);
+    let keywordCalls = 0;
+    engine.searchKeyword = async (query, opts) => {
+      keywordCalls++;
+      return originalKeyword(query, opts);
+    };
+    try {
+      const results = await hybridSearch(
+        engine,
+        'show me the emerald falcon pricing decision image',
+        { limit: 5, crossModal: 'image' },
+      );
+      expect(results).toEqual([]);
+      expect(keywordCalls).toBe(0);
+    } finally {
+      engine.searchKeyword = originalKeyword;
+    }
   });
 });

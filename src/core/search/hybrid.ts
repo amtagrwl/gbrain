@@ -1055,11 +1055,12 @@ export async function hybridSearch(
     // it never has to read config. Engines normalize string-or-descriptor
     // via normalizeEngineColumn; the descriptor path is the strict one.
     embeddingColumn: resolvedCol,
-    // D2 fix (fix/title-retrieval-arm, Reviewer F1): the hybrid keyword arm
-    // opts into the engine's AND→OR zero-recall fallback only for short
-    // lookup-style queries. Long prose keeps strict keyword + the ungated
-    // page-title and vector arms without paying for a broad chunk-grain OR.
-    // Direct searchKeyword consumers keep their existing explicit contract.
+    // Long prose starts with strict keyword search so the normal vector-backed
+    // path never pays for a broad chunk-grain OR. The no-vector return paths
+    // below lazily restore the historical OR rescue when strict search was
+    // empty; that preserves zero-config/degraded recall without reintroducing
+    // the expensive query on a healthy vector path. Direct searchKeyword
+    // consumers keep their existing explicit contract.
     orFallback: useHybridKeywordOrFallback(query),
   };
   // Track what actually ran for the optional onMeta callback (v0.25.0).
@@ -1144,6 +1145,21 @@ export async function hybridSearch(
             return [] as SearchResult[];
           }),
         ]);
+
+  // The long-query OR fallback is intentionally deferred until we know vector
+  // retrieval is unavailable or failed. Title search cannot substitute for
+  // body/chunk recall (pages.search_vector indexes title + timeline, not the
+  // full body), so degraded paths must retain the historical chunk-grain
+  // rescue. Short queries already ran it in the first pass; non-empty strict
+  // results never need dilution.
+  const recoverKeywordResultsForDegradedVectorPath = async (): Promise<SearchResult[]> => {
+    // Preserve image-only routing: its contract explicitly skips text keyword
+    // candidates even when the multimodal provider is unavailable.
+    if (earlyModality === 'image' || keywordResults.length > 0 || searchOpts.orFallback !== false) {
+      return keywordResults;
+    }
+    return engine.searchKeyword(query, { ...searchOpts, orFallback: true });
+  };
 
   // v0.29.1: resolve salience/recency from caller (back-compat aliases for
   // PR #618's `recencyBoost` numeric scale) or fall back to the heuristic.
@@ -1241,6 +1257,7 @@ export async function hybridSearch(
       mayEscalateToMultimodal) &&
     isAvailable('embedding', multimodalProviderProbe);
   if (!isAvailable('embedding', providerProbe) && !willTryMultimodal) {
+    const degradedKeywordResults = await recoverKeywordResultsForDegradedVectorPath();
     // v0.43 — fuse the relational arm with keyword so typed-edge answers
     // survive on the no-embedding-provider path (the relational win is most
     // valuable exactly when vector is unavailable). The title arm fuses here
@@ -1248,11 +1265,11 @@ export async function hybridSearch(
     // chunk-grain keyword FTS alone fails (D1).
     // issue #160: stamp unverified stubs BEFORE fusion so the compiled-truth
     // boost skips them (flag survives fusion's result spread).
-    await stampUnverifiedExtractions(engine, [...keywordResults, ...titleResults, ...relationalList]);
-    let noEmbedResults = keywordResults;
+    await stampUnverifiedExtractions(engine, [...degradedKeywordResults, ...titleResults, ...relationalList]);
+    let noEmbedResults = degradedKeywordResults;
     if (relationalList.length > 0 || titleResults.length > 0) {
       const fk = opts?.rrfK ?? RRF_K;
-      const noEmbedLists = [{ list: keywordResults, k: fk }];
+      const noEmbedLists = [{ list: degradedKeywordResults, k: fk }];
       if (titleResults.length > 0) noEmbedLists.push({ list: titleResults, k: fk });
       if (relationalList.length > 0) noEmbedLists.push({ list: relationalList, k: fk });
       noEmbedResults = rrfFusionWeighted(noEmbedLists, shouldBoostCompiledTruth(detailResolved));
@@ -1482,7 +1499,8 @@ export async function hybridSearch(
     }
   }
 
-  if (vectorLists.length === 0) {
+  if (!vectorLists.some((list) => list.length > 0)) {
+    const degradedKeywordResults = await recoverKeywordResultsForDegradedVectorPath();
     // Embed/vector failed silently; record that vector did not run.
     // v0.29.1 codex pass-2 #4: this is the third return path. Apply
     // post-fusion stages here too — without it, salience='on' silently
@@ -1492,11 +1510,11 @@ export async function hybridSearch(
     // here too (same rationale as the no-embedding-provider path — D1).
     // issue #160: stamp unverified stubs BEFORE fusion (see the
     // no-embedding-provider path for rationale).
-    await stampUnverifiedExtractions(engine, [...keywordResults, ...titleResults, ...relationalList]);
-    let fallbackResults = keywordResults;
+    await stampUnverifiedExtractions(engine, [...degradedKeywordResults, ...titleResults, ...relationalList]);
+    let fallbackResults = degradedKeywordResults;
     if (relationalList.length > 0 || titleResults.length > 0) {
       const fk = opts?.rrfK ?? RRF_K;
-      const fallbackLists = [{ list: keywordResults, k: fk }];
+      const fallbackLists = [{ list: degradedKeywordResults, k: fk }];
       if (titleResults.length > 0) fallbackLists.push({ list: titleResults, k: fk });
       if (relationalList.length > 0) fallbackLists.push({ list: relationalList, k: fk });
       fallbackResults = rrfFusionWeighted(fallbackLists, shouldBoostCompiledTruth(detail));
