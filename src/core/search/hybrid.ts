@@ -1499,7 +1499,7 @@ export async function hybridSearch(
     }
   }
 
-  if (!vectorLists.some((list) => list.length > 0)) {
+  if (vectorLists.length === 0) {
     const degradedKeywordResults = await recoverKeywordResultsForDegradedVectorPath();
     // Embed/vector failed silently; record that vector did not run.
     // v0.29.1 codex pass-2 #4: this is the third return path. Apply
@@ -1568,6 +1568,10 @@ export async function hybridSearch(
   const imageRrfK = effectiveRrfK(baseRrfK, resolvedMode.cross_modal_both_image_weight);
   const isBothMode = effectiveModality === 'both' && vectorLists.length >= 2;
 
+  const mainPathKeywordResults = vectorLists.some((list) => list.length > 0)
+    ? keywordResults
+    : await recoverKeywordResultsForDegradedVectorPath();
+
   const allLists: Array<{ list: SearchResult[]; k: number }> = isBothMode
     ? [
       // Last list in vectorLists is the image branch (we appended it above).
@@ -1575,11 +1579,11 @@ export async function hybridSearch(
       // get textRrfK. Image branch gets imageRrfK.
       ...vectorLists.slice(0, -1).map(list => ({ list, k: textRrfK })),
       { list: vectorLists[vectorLists.length - 1], k: imageRrfK },
-      { list: keywordResults, k: keywordK },
+      { list: mainPathKeywordResults, k: keywordK },
     ]
     : [
       ...vectorLists.map(list => ({ list, k: vectorK })),
-      { list: keywordResults, k: keywordK },
+      { list: mainPathKeywordResults, k: keywordK },
     ];
 
   // D1 fix (fix/title-retrieval-arm) — title candidate arm as a third

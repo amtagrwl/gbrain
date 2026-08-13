@@ -535,6 +535,50 @@ describe('hybridSearch wiring — title arm reaches the fused result set', () =>
     }
   });
 
+  test('empty vector results preserve low-to-high detail escalation', async () => {
+    await engine.putPage('notes/timeline-only', {
+      type: 'note',
+      title: 'Release Notes',
+      compiled_truth: 'A summary without the hidden evidence.',
+    });
+    await engine.upsertChunks('notes/timeline-only', [
+      {
+        chunk_index: 0,
+        chunk_text: 'crimson otter hidden timeline fact',
+        chunk_source: 'timeline',
+      },
+    ]);
+
+    const originalVector = engine.searchVector.bind(engine);
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: DIM,
+      env: { OPENAI_API_KEY: 'test-only' },
+    });
+    __setEmbedTransportForTests(async () => ({
+      embeddings: [new Array(DIM).fill(0.01)],
+      usage: { tokens: 1 },
+    } as any));
+    engine.searchVector = async () => [];
+
+    try {
+      const results = await hybridSearch(
+        engine,
+        'crimson otter hidden timeline fact',
+        { limit: 5, detail: 'low' },
+      );
+      expect(results.map(r => r.slug)).toContain('notes/timeline-only');
+    } finally {
+      engine.searchVector = originalVector;
+      __setEmbedTransportForTests(null);
+      configureGateway({
+        embedding_model: 'openai:text-embedding-3-large',
+        embedding_dimensions: DIM,
+        env: {},
+      });
+    }
+  });
+
   test('image-only routing never resurrects text keyword recovery', async () => {
     const originalKeyword = engine.searchKeyword.bind(engine);
     let keywordCalls = 0;
