@@ -231,6 +231,9 @@ export function buildBestPerPagePoolCte(candidateCte: string): string {
 // AND→OR keyword-recall fallback (fix/title-retrieval-arm, D2)
 // ============================================================
 
+// Preserve short lookup rescue without generating broad, expensive OR candidate sets.
+const MAX_OR_FALLBACK_TOKENS = 6;
+
 /**
  * Build a relaxed OR-of-terms websearch string for the keyword-arm recall
  * fallback.
@@ -251,6 +254,8 @@ export function buildBestPerPagePoolCte(candidateCte: string): string {
  * Returns null when relaxation is pointless or unsafe:
  *   - fewer than 2 tokens survive tokenization (OR of one term is the same
  *     query as AND of one term);
+ *   - more than 6 tokens survive tokenization (long natural-language queries
+ *     retain strict keyword, title, and vector recall without a broad OR retry);
  *   - the raw query uses websearch OPERATORS (Reviewer F3): a `-term`
  *     negation would be RESURRECTED as a positive OR term, and a quoted
  *     phrase would degrade to a bag of words — both invert caller intent,
@@ -268,7 +273,7 @@ export function buildOrFallbackWebsearchQuery(query: string): string | null {
     .split(/[^\p{L}\p{N}]+/u)
     .filter(Boolean)
     .filter(t => { const u = t.toUpperCase(); return u !== 'OR' && u !== 'AND'; });
-  if (tokens.length < 2) return null;
+  if (tokens.length < 2 || tokens.length > MAX_OR_FALLBACK_TOKENS) return null;
   return tokens.join(' OR ');
 }
 

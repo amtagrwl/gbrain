@@ -234,6 +234,21 @@ describe('buildOrFallbackWebsearchQuery — pure', () => {
   test('joins tokens with OR', () => {
     expect(buildOrFallbackWebsearchQuery('alpha beta')).toBe('alpha OR beta');
   });
+  test('allows OR fallback for up to 6 non-operator tokens', () => {
+    expect(buildOrFallbackWebsearchQuery('alpha beta gamma delta epsilon zeta')).toBe(
+      'alpha OR beta OR gamma OR delta OR epsilon OR zeta',
+    );
+  });
+  test('returns null for 7 non-operator tokens', () => {
+    expect(buildOrFallbackWebsearchQuery('alpha beta gamma delta epsilon zeta eta')).toBeNull();
+  });
+  test('returns null for a realistic long natural-language question', () => {
+    expect(
+      buildOrFallbackWebsearchQuery(
+        'Which planning decisions changed after the quarterly review meeting last week?',
+      ),
+    ).toBeNull();
+  });
   test('returns null for <2 tokens', () => {
     expect(buildOrFallbackWebsearchQuery('alpha')).toBeNull();
     expect(buildOrFallbackWebsearchQuery('')).toBeNull();
@@ -248,6 +263,9 @@ describe('buildOrFallbackWebsearchQuery — pure', () => {
   });
   test('interior hyphens are not operators — still relaxed', () => {
     expect(buildOrFallbackWebsearchQuery('alpha-beta gamma')).toBe('alpha OR beta OR gamma');
+  });
+  test('preserves Unicode-aware NFKC normalization and tokenization', () => {
+    expect(buildOrFallbackWebsearchQuery('ａｌｐｈａ café 東京')).toBe('alpha OR café OR 東京');
   });
   test('drops literal OR/AND words so they cannot re-parse as operators', () => {
     expect(buildOrFallbackWebsearchQuery('alpha or beta')).toBe('alpha OR beta');
