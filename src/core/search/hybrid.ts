@@ -48,6 +48,27 @@ import {
 
 export const RRF_K = 60;
 const COMPILED_TRUTH_BOOST = 2.0;
+const MAX_HYBRID_KEYWORD_OR_FALLBACK_TOKENS = 6;
+
+/**
+ * Keep the chunk-grain keyword OR retry for short lookup-style queries only.
+ * Long natural-language queries already retain strict keyword, title, and
+ * vector recall; an OR of every prose token creates a broad candidate set.
+ * This gate is intentionally hybrid-only: the shared fallback builder and
+ * page-grain title arm remain ungated for direct callers and long near-title
+ * lookups.
+ */
+function useHybridKeywordOrFallback(query: string): boolean {
+  const tokens = query
+    .normalize('NFKC')
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean)
+    .filter((token) => {
+      const upper = token.toUpperCase();
+      return upper !== 'OR' && upper !== 'AND';
+    });
+  return tokens.length <= MAX_HYBRID_KEYWORD_OR_FALLBACK_TOKENS;
+}
 
 /**
  * Which detail levels get the compiled_truth boost (#3430).
@@ -1035,10 +1056,11 @@ export async function hybridSearch(
     // via normalizeEngineColumn; the descriptor path is the strict one.
     embeddingColumn: resolvedCol,
     // D2 fix (fix/title-retrieval-arm, Reviewer F1): the hybrid keyword arm
-    // is a recall arm — opt in to the engine's AND→OR zero-recall fallback.
-    // Direct searchKeyword consumers (countMentions, link-extraction, eval)
-    // do NOT set this and keep the strict-AND contract.
-    orFallback: true,
+    // opts into the engine's AND→OR zero-recall fallback only for short
+    // lookup-style queries. Long prose keeps strict keyword + the ungated
+    // page-title and vector arms without paying for a broad chunk-grain OR.
+    // Direct searchKeyword consumers keep their existing explicit contract.
+    orFallback: useHybridKeywordOrFallback(query),
   };
   // Track what actually ran for the optional onMeta callback (v0.25.0).
   // Caller leaves onMeta undefined → these flags are computed but never

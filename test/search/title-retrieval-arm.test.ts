@@ -111,6 +111,26 @@ describe('searchTitles — D1 title candidate arm', () => {
     expect(hits.map(r => r.slug)).toContain('reports/emerald-falcon');
   });
 
+  test('long near-title query still retrieves through the page-grain OR fallback', async () => {
+    const longTitle = 'Emerald Falcon Doctrine Quarterly Synthesis Report Alpha Bravo Charlie Delta';
+    await engine.putPage('reports/emerald-falcon', {
+      type: 'note',
+      title: longTitle,
+      compiled_truth: 'An annual planning artifact.',
+    });
+    await engine.upsertChunks('reports/emerald-falcon', [
+      { chunk_index: 0, chunk_text: 'An annual planning artifact.', chunk_source: 'compiled_truth' },
+    ]);
+
+    // The final token deliberately differs, so strict title AND returns zero
+    // and the page-grain OR fallback must generate the candidate.
+    const hits = await engine.searchTitles(
+      'Emerald Falcon Doctrine Quarterly Synthesis Report Alpha Bravo Charlie Epsilon',
+      { limit: 10 },
+    );
+    expect(hits.map(r => r.slug)).toContain('reports/emerald-falcon');
+  });
+
   test('representative chunk prefers compiled_truth, else lowest chunk_index', async () => {
     await engine.putPage('notes/mixed-chunks', {
       type: 'note',
@@ -234,20 +254,10 @@ describe('buildOrFallbackWebsearchQuery — pure', () => {
   test('joins tokens with OR', () => {
     expect(buildOrFallbackWebsearchQuery('alpha beta')).toBe('alpha OR beta');
   });
-  test('allows OR fallback for up to 6 non-operator tokens', () => {
-    expect(buildOrFallbackWebsearchQuery('alpha beta gamma delta epsilon zeta')).toBe(
-      'alpha OR beta OR gamma OR delta OR epsilon OR zeta',
+  test('preserves the shared OR fallback contract for 7+ non-operator tokens', () => {
+    expect(buildOrFallbackWebsearchQuery('alpha beta gamma delta epsilon zeta eta')).toBe(
+      'alpha OR beta OR gamma OR delta OR epsilon OR zeta OR eta',
     );
-  });
-  test('returns null for 7 non-operator tokens', () => {
-    expect(buildOrFallbackWebsearchQuery('alpha beta gamma delta epsilon zeta eta')).toBeNull();
-  });
-  test('returns null for a realistic long natural-language question', () => {
-    expect(
-      buildOrFallbackWebsearchQuery(
-        'Which planning decisions changed after the quarterly review meeting last week?',
-      ),
-    ).toBeNull();
   });
   test('returns null for <2 tokens', () => {
     expect(buildOrFallbackWebsearchQuery('alpha')).toBeNull();
@@ -276,6 +286,32 @@ describe('buildOrFallbackWebsearchQuery — pure', () => {
 });
 
 describe('hybridSearch wiring — title arm reaches the fused result set', () => {
+  test('bounds only the hybrid keyword OR fallback while always invoking the title arm', async () => {
+    const originalKeyword = engine.searchKeyword.bind(engine);
+    const originalTitles = engine.searchTitles.bind(engine);
+    const keywordFallbacks: Array<boolean | undefined> = [];
+    let titleCalls = 0;
+    engine.searchKeyword = async (query, opts) => {
+      keywordFallbacks.push(opts?.orFallback);
+      return originalKeyword(query, opts);
+    };
+    engine.searchTitles = async (query, opts) => {
+      titleCalls += 1;
+      return originalTitles(query, opts);
+    };
+
+    try {
+      await hybridSearch(engine, 'alpha beta gamma delta epsilon zeta', { limit: 5 });
+      await hybridSearch(engine, 'alpha beta gamma delta epsilon zeta eta', { limit: 5 });
+    } finally {
+      engine.searchKeyword = originalKeyword;
+      engine.searchTitles = originalTitles;
+    }
+
+    expect(keywordFallbacks).toEqual([true, false]);
+    expect(titleCalls).toBe(2);
+  });
+
   test('exact-title query surfaces the page through hybridSearch (keyword-only path)', async () => {
     await seedTitleOnlyPage();
     const results = await hybridSearch(engine, 'Chronomancer Codex Ledger', { limit: 5 });
