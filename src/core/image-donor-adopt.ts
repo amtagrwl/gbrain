@@ -13,6 +13,11 @@ import {
 
 export const IMAGE_DONOR_ADOPTION_POLICY_VERSION =
   'exact-hash-source-local-image-donor-min120-v1';
+export const IMAGE_DONOR_OCR_ONLY_ADOPTION_POLICY_VERSION =
+  'exact-hash-source-local-image-donor-min120-ocr-only-v2';
+export type ExactHashDonorAdoptionPolicyVersion =
+  | typeof IMAGE_DONOR_ADOPTION_POLICY_VERSION
+  | typeof IMAGE_DONOR_OCR_ONLY_ADOPTION_POLICY_VERSION;
 export const IMAGE_DONOR_MIN_OCR_CHARACTERS = 120;
 export const IMAGE_DONOR_REQUIRED_SCHEMA_VERSION = 125;
 
@@ -33,7 +38,7 @@ export interface ExactHashDonorTarget {
 }
 
 export interface ExactHashDonorAdoptionReceipt {
-  policy_version: typeof IMAGE_DONOR_ADOPTION_POLICY_VERSION;
+  policy_version: ExactHashDonorAdoptionPolicyVersion;
   manifest_hash: string;
   manifest_index: number;
   source_id: string;
@@ -44,7 +49,7 @@ export interface ExactHashDonorAdoptionReceipt {
   donor_page_id: number;
   donor_chunk_id: number;
   donor_state_sha256: string;
-  text_embedding_sha256: string;
+  text_embedding_sha256: string | null;
   image_embedding_sha256: string | null;
   multimodal_embedding_sha256: string | null;
   target_page_id: number;
@@ -125,15 +130,17 @@ interface ExactHashDonorSqlRow extends Record<string, unknown> {
   donor_source_id: string;
   donor_slug: string;
   compiled_truth: string;
+  page_search_vector: string;
   embedding_signature: string | null;
   contextual_retrieval_mode: string | null;
   corpus_generation: string | null;
   chunk_text: string;
+  chunk_search_vector: string;
   model: string;
   token_count: number | null;
   embedded_at: Date | string | null;
-  embedding: string;
-  embedding_dims: number;
+  embedding: string | null;
+  embedding_dims: number | null;
   embedding_image: string | null;
   embedding_multimodal: string | null;
 }
@@ -196,28 +203,76 @@ function donorState(row: ExactHashDonorSqlRow): Record<string, unknown> {
     token_count: row.token_count,
     embedded_at: row.embedded_at,
     embedding: row.embedding,
-    embedding_dims: Number(row.embedding_dims),
+    embedding_dims: row.embedding_dims === null ? null : Number(row.embedding_dims),
     embedding_image: row.embedding_image,
     embedding_multimodal: row.embedding_multimodal,
   };
 }
 
+function donorPolicyVersion(row: ExactHashDonorSqlRow): ExactHashDonorAdoptionPolicyVersion {
+  return row.embedding === null
+    ? IMAGE_DONOR_OCR_ONLY_ADOPTION_POLICY_VERSION
+    : IMAGE_DONOR_ADOPTION_POLICY_VERSION;
+}
+
+function donorStateDigest(row: ExactHashDonorSqlRow): string {
+  const state = donorState(row);
+  if (donorPolicyVersion(row) === IMAGE_DONOR_OCR_ONLY_ADOPTION_POLICY_VERSION) {
+    state.page_search_vector = row.page_search_vector;
+    state.chunk_search_vector = row.chunk_search_vector;
+  }
+  return exactHashStateDigest(state);
+}
+
+function isSha256Digest(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+}
+
+function policyMatchesEmbeddingDigests(
+  policy: unknown,
+  text: unknown,
+  image: unknown,
+  multimodal: unknown,
+): policy is ExactHashDonorAdoptionPolicyVersion {
+  if (policy === IMAGE_DONOR_ADOPTION_POLICY_VERSION) {
+    return isSha256Digest(text)
+      && (image === null || isSha256Digest(image))
+      && (multimodal === null || isSha256Digest(multimodal));
+  }
+  return policy === IMAGE_DONOR_OCR_ONLY_ADOPTION_POLICY_VERSION
+    && text === null
+    && image === null
+    && multimodal === null;
+}
+
 function donorQualifies(row: ExactHashDonorSqlRow): boolean {
   const text = String(row.compiled_truth ?? '');
   const model = String(row.model ?? '');
-  const dims = Number(row.embedding_dims);
   const signature = row.embedding_signature;
-  return row.chunk_text === text
+  const baseQualifies = row.chunk_text === text
     && text.length >= IMAGE_DONOR_MIN_OCR_CHARACTERS
     && text.trim().length > 0
     && /[\p{L}\p{N}]/u.test(text)
-    && model.trim().length > 0
+    && typeof row.page_search_vector === 'string'
+    && row.page_search_vector.trim().length > 0
+    && typeof row.chunk_search_vector === 'string'
+    && row.chunk_search_vector.trim().length > 0
+    && (row.contextual_retrieval_mode === null || row.contextual_retrieval_mode === 'none')
+    && row.corpus_generation === null;
+  if (!baseQualifies) return false;
+  if (row.embedding === null) {
+    return row.embedding_image === null
+      && row.embedding_multimodal === null
+      && signature === null
+      && row.token_count === null
+      && row.embedded_at === null;
+  }
+  const dims = Number(row.embedding_dims);
+  return model.trim().length > 0
     && Number.isSafeInteger(dims)
     && dims > 0
     && (row.token_count === null || (Number.isSafeInteger(Number(row.token_count)) && Number(row.token_count) >= 0))
-    && (signature === null || signature === `${model}:${dims}`)
-    && (row.contextual_retrieval_mode === null || row.contextual_retrieval_mode === 'none')
-    && row.corpus_generation === null;
+    && (signature === null || signature === `${model}:${dims}`);
 }
 
 async function selectExactHashDonor(
@@ -245,15 +300,17 @@ async function selectExactHashDonor(
        p.source_id AS donor_source_id,
        p.slug AS donor_slug,
        p.compiled_truth,
+       p.search_vector::text AS page_search_vector,
        p.embedding_signature,
        p.contextual_retrieval_mode,
        p.corpus_generation,
        cc.chunk_text,
+       cc.search_vector::text AS chunk_search_vector,
        cc.model,
        cc.token_count,
        cc.embedded_at,
-       cc.embedding::text AS embedding,
-       vector_dims(cc.embedding)::int AS embedding_dims,
+       CASE WHEN cc.embedding IS NULL THEN NULL ELSE cc.embedding::text END AS embedding,
+       CASE WHEN cc.embedding IS NULL THEN NULL ELSE vector_dims(cc.embedding)::int END AS embedding_dims,
        CASE WHEN cc.embedding_image IS NULL THEN NULL ELSE cc.embedding_image::text END AS embedding_image,
        CASE WHEN cc.embedding_multimodal IS NULL THEN NULL ELSE cc.embedding_multimodal::text END AS embedding_multimodal
      FROM pages p
@@ -269,11 +326,26 @@ async function selectExactHashDonor(
        AND cc.chunk_text = p.compiled_truth
        AND length(p.compiled_truth) >= ${IMAGE_DONOR_MIN_OCR_CHARACTERS}
        AND btrim(p.compiled_truth) <> ''
-       AND cc.embedding IS NOT NULL
-       AND btrim(cc.model) <> ''
-       AND (cc.token_count IS NULL OR cc.token_count >= 0)
-       AND (p.embedding_signature IS NULL
-            OR p.embedding_signature = cc.model || ':' || vector_dims(cc.embedding)::text)
+       AND p.compiled_truth ~ '[[:alnum:]]'
+       AND p.search_vector IS NOT NULL
+       AND btrim(p.search_vector::text) <> ''
+       AND cc.search_vector IS NOT NULL
+       AND btrim(cc.search_vector::text) <> ''
+       AND (
+         (cc.embedding IS NOT NULL
+          AND btrim(cc.model) <> ''
+          AND vector_dims(cc.embedding) > 0
+          AND (cc.token_count IS NULL OR cc.token_count >= 0)
+          AND (p.embedding_signature IS NULL
+               OR p.embedding_signature = cc.model || ':' || vector_dims(cc.embedding)::text))
+         OR
+         (cc.embedding IS NULL
+          AND cc.embedding_image IS NULL
+          AND cc.embedding_multimodal IS NULL
+          AND p.embedding_signature IS NULL
+          AND cc.token_count IS NULL
+          AND cc.embedded_at IS NULL)
+       )
        AND (SELECT count(*) FROM content_chunks one_chunk WHERE one_chunk.page_id = p.id) = 1
        ${boundSql}
      ORDER BY p.id ASC, cc.id ASC
@@ -370,7 +442,15 @@ function finalizeReceipt(
 
 function validateReceipt(receipt: ExactHashDonorAdoptionReceipt): void {
   const { receipt_sha256: supplied, ...body } = receipt;
-  if (supplied !== exactHashStateDigest(body)) throw new ExactHashDonorRollbackConflictError();
+  if (
+    supplied !== exactHashStateDigest(body)
+    || !policyMatchesEmbeddingDigests(
+      receipt.policy_version,
+      receipt.text_embedding_sha256,
+      receipt.image_embedding_sha256,
+      receipt.multimodal_embedding_sha256,
+    )
+  ) throw new ExactHashDonorRollbackConflictError();
 }
 
 function canonicalFrontmatter(
@@ -392,12 +472,12 @@ function canonicalFrontmatter(
     mime_type: target.mimeType,
     bytes: target.sizeBytes,
     image_donor_adoption: {
-      policy_version: IMAGE_DONOR_ADOPTION_POLICY_VERSION,
+      policy_version: donorPolicyVersion(donor),
       manifest_hash: target.manifestHash,
       manifest_index: target.manifestIndex,
       donor_page_id: safeInteger(donor.donor_page_id),
       donor_chunk_id: safeInteger(donor.donor_chunk_id),
-      donor_state_sha256: exactHashStateDigest(donorState(donor)),
+      donor_state_sha256: donorStateDigest(donor),
       image_sha256: target.sha256,
       ocr_sha256: createHash('sha256').update(donor.compiled_truth).digest('hex'),
       text_embedding_sha256: vectorDigest(donor.embedding),
@@ -532,7 +612,13 @@ async function exactPriorAdoption(
   if (existingPage.deleted_at !== null) return null;
   const provenance = adoptionProvenance(existingPage.frontmatter);
   if (
-    provenance?.policy_version !== IMAGE_DONOR_ADOPTION_POLICY_VERSION
+    !provenance
+    || !policyMatchesEmbeddingDigests(
+      provenance.policy_version,
+      provenance.text_embedding_sha256,
+      provenance.image_embedding_sha256,
+      provenance.multimodal_embedding_sha256,
+    )
     || provenance.manifest_hash !== target.manifestHash
     || Number(provenance.manifest_index) !== target.manifestIndex
     || provenance.image_sha256 !== target.sha256
@@ -540,7 +626,6 @@ async function exactPriorAdoption(
     || !Number.isSafeInteger(Number(provenance.donor_chunk_id))
     || !Number.isSafeInteger(Number(provenance.file_id))
     || typeof provenance.donor_state_sha256 !== 'string'
-    || typeof provenance.text_embedding_sha256 !== 'string'
   ) return null;
   const fileDisposition = provenance.file_disposition;
   if (fileDisposition !== 'created' && fileDisposition !== 'preserved_existing') return null;
@@ -550,7 +635,8 @@ async function exactPriorAdoption(
   });
   if (!donor) return null;
   if (
-    provenance.donor_state_sha256 !== exactHashStateDigest(donorState(donor))
+    provenance.policy_version !== donorPolicyVersion(donor)
+    || provenance.donor_state_sha256 !== donorStateDigest(donor)
     || provenance.text_embedding_sha256 !== vectorDigest(donor.embedding)
     || provenance.image_embedding_sha256 !== vectorDigest(donor.embedding_image)
     || provenance.multimodal_embedding_sha256 !== vectorDigest(donor.embedding_multimodal)
@@ -574,7 +660,7 @@ async function exactPriorAdoption(
   if (!targetMatchesDonor(replayState, target, donor, file, fileDisposition)) return null;
   const page = replayState.page as Record<string, unknown>;
   const receipt = finalizeReceipt({
-    policy_version: IMAGE_DONOR_ADOPTION_POLICY_VERSION,
+    policy_version: donorPolicyVersion(donor),
     manifest_hash: target.manifestHash,
     manifest_index: target.manifestIndex,
     source_id: target.sourceId,
@@ -584,8 +670,8 @@ async function exactPriorAdoption(
     ocr_sha256: createHash('sha256').update(donor.compiled_truth).digest('hex'),
     donor_page_id: safeInteger(donor.donor_page_id),
     donor_chunk_id: safeInteger(donor.donor_chunk_id),
-    donor_state_sha256: exactHashStateDigest(donorState(donor)),
-    text_embedding_sha256: vectorDigest(donor.embedding)!,
+    donor_state_sha256: donorStateDigest(donor),
+    text_embedding_sha256: vectorDigest(donor.embedding),
     image_embedding_sha256: vectorDigest(donor.embedding_image),
     multimodal_embedding_sha256: vectorDigest(donor.embedding_multimodal),
     target_page_id: safeInteger(existingPage.id),
@@ -643,7 +729,7 @@ export async function importImageFileWithExactHashDonor(
 
     const donor = await selectExactHashDonor(tx, target.sha256, null);
     if (!donor) throw new ExactHashDonorUnavailableError();
-    const donorBefore = exactHashStateDigest(donorState(donor));
+    const donorBefore = donorStateDigest(donor);
     await options.afterDonorLockForTest?.(tx, {
       pageId: safeInteger(donor.donor_page_id),
       chunkId: safeInteger(donor.donor_chunk_id),
@@ -652,7 +738,7 @@ export async function importImageFileWithExactHashDonor(
       pageId: safeInteger(donor.donor_page_id),
       chunkId: safeInteger(donor.donor_chunk_id),
     });
-    if (!reboundDonor || exactHashStateDigest(donorState(reboundDonor)) !== donorBefore) {
+    if (!reboundDonor || donorStateDigest(reboundDonor) !== donorBefore) {
       throw new ExactHashDonorUnavailableError();
     }
 
@@ -722,7 +808,25 @@ export async function importImageFileWithExactHashDonor(
           AND cc.chunk_source='image_asset'
           AND cc.modality='image'
           AND cc.chunk_text=p.compiled_truth
-          AND cc.embedding IS NOT NULL
+          AND p.search_vector IS NOT NULL
+          AND btrim(p.search_vector::text) <> ''
+          AND cc.search_vector IS NOT NULL
+          AND btrim(cc.search_vector::text) <> ''
+          AND (
+            (cc.embedding IS NOT NULL
+             AND btrim(cc.model) <> ''
+             AND vector_dims(cc.embedding) > 0
+             AND (cc.token_count IS NULL OR cc.token_count >= 0)
+             AND (p.embedding_signature IS NULL
+                  OR p.embedding_signature = cc.model || ':' || vector_dims(cc.embedding)::text))
+            OR
+            (cc.embedding IS NULL
+             AND cc.embedding_image IS NULL
+             AND cc.embedding_multimodal IS NULL
+             AND p.embedding_signature IS NULL
+             AND cc.token_count IS NULL
+             AND cc.embedded_at IS NULL)
+          )
           AND (SELECT count(*) FROM content_chunks one_chunk WHERE one_chunk.page_id=p.id)=1
        RETURNING id, created_at, search_vector::text AS search_vector`,
       [targetPageId, reboundDonor.donor_page_id, reboundDonor.donor_chunk_id, target.sha256],
@@ -790,7 +894,7 @@ export async function importImageFileWithExactHashDonor(
     const fileAfter = await selectGlobalFile(tx, target.sourceRelativePath);
     if (
       !donorAfter
-      || exactHashStateDigest(donorState(donorAfter)) !== donorBefore
+      || donorStateDigest(donorAfter) !== donorBefore
       || !targetState
       || !fileAfter
       || exactHashStateDigest(fileAfter) !== filePoststateSha256
@@ -808,7 +912,7 @@ export async function importImageFileWithExactHashDonor(
     target.validatePhysical(sources[0].local_path);
     const targetPage = targetState.page as Record<string, unknown>;
     const receipt = finalizeReceipt({
-      policy_version: IMAGE_DONOR_ADOPTION_POLICY_VERSION,
+      policy_version: donorPolicyVersion(donorAfter),
       manifest_hash: target.manifestHash,
       manifest_index: target.manifestIndex,
       source_id: target.sourceId,
@@ -819,7 +923,7 @@ export async function importImageFileWithExactHashDonor(
       donor_page_id: safeInteger(donorAfter.donor_page_id),
       donor_chunk_id: safeInteger(donorAfter.donor_chunk_id),
       donor_state_sha256: donorBefore,
-      text_embedding_sha256: vectorDigest(donorAfter.embedding)!,
+      text_embedding_sha256: vectorDigest(donorAfter.embedding),
       image_embedding_sha256: vectorDigest(donorAfter.embedding_image),
       multimodal_embedding_sha256: vectorDigest(donorAfter.embedding_multimodal),
       target_page_id: targetPageId,

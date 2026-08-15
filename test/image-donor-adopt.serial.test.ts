@@ -64,6 +64,20 @@ function dateText(value: unknown): string {
   return value instanceof Date ? value.toISOString() : String(value);
 }
 
+function stableStateDigest(value: unknown): string {
+  const normalize = (item: unknown): unknown => {
+    if (item instanceof Date) return item.toISOString();
+    if (typeof item === 'bigint') return item.toString();
+    if (Array.isArray(item)) return item.map(normalize);
+    if (item && typeof item === 'object') {
+      const record = item as Record<string, unknown>;
+      return Object.fromEntries(Object.keys(record).sort().map(key => [key, normalize(record[key])]));
+    }
+    return item;
+  };
+  return sha256(JSON.stringify(normalize(value)));
+}
+
 interface Fixture {
   root: string;
   filePath: string;
@@ -613,6 +627,145 @@ describe('exact-hash donor qualification and adoption transaction', () => {
     expect(await engine.getConfig('ocr_provider_attempts')).toBe('17');
     expect(await engine.getConfig('ocr_successful_provider_receipts')).toBe('13');
     expect(await engine.getConfig('ocr_persisted_imports')).toBe('11');
+  });
+
+  test('adopts an OCR-only exact-hash donor with generated keyword vectors and exact replay/rollback', async () => {
+    const f = await fixture('ocr-only');
+    const ocrText = `NebulaAnchor42 ${'bounded paid OCR text 123 '.repeat(8)}`;
+    const donor = await seedDonor(f.hash, {
+      slug: 'donors/ocr-only.png',
+      text: ocrText,
+      embedding: null,
+      embeddingImage: null,
+      embeddingMultimodal: null,
+      embeddingSignature: null,
+      model: 'bounded-paid-ocr:model',
+      tokenCount: null,
+      embeddedAt: null,
+    });
+    await engine.setConfig('ocr_provider_attempts', '17');
+    await engine.setConfig('ocr_successful_provider_receipts', '13');
+    await engine.setConfig('ocr_persisted_imports', '11');
+
+    const donorSearch = await engine.executeRaw<Record<string, unknown>>(
+      `SELECT p.search_vector::text AS page_search_vector,
+              cc.search_vector::text AS chunk_search_vector
+         FROM pages p
+         JOIN content_chunks cc ON cc.page_id=p.id
+        WHERE p.id=$1 AND cc.id=$2`,
+      [donor.pageId, donor.chunkId],
+    );
+    expect(String(donorSearch[0]?.page_search_vector).trim()).not.toBe('');
+    expect(String(donorSearch[0]?.chunk_search_vector).trim()).not.toBe('');
+
+    const result = await adopt(f);
+    expect(result.status).toBe('adopted');
+    if (result.status !== 'adopted') throw new Error('expected OCR-only adoption');
+    expect(result.receipt).toMatchObject({
+      policy_version: 'exact-hash-source-local-image-donor-min120-ocr-only-v2',
+      donor_page_id: donor.pageId,
+      donor_chunk_id: donor.chunkId,
+      text_embedding_sha256: null,
+      image_embedding_sha256: null,
+      multimodal_embedding_sha256: null,
+    });
+
+    const targetPage = await pageState(result.receipt.target_page_id);
+    const targetChunk = await chunkState(result.receipt.target_chunk_id);
+    expect(targetPage).toMatchObject({
+      source_id: f.sourceId,
+      slug: f.slug,
+      compiled_truth: ocrText,
+      embedding_signature: null,
+    });
+    expect(targetChunk).toMatchObject({
+      chunk_text: ocrText,
+      model: 'bounded-paid-ocr:model',
+      token_count: null,
+      embedded_at: null,
+      embedding: null,
+      embedding_image: null,
+      embedding_multimodal: null,
+    });
+    expect(await engine.getPage(f.slug, { sourceId: f.sourceId })).toMatchObject({
+      slug: f.slug,
+      source_id: f.sourceId,
+      compiled_truth: ocrText,
+    });
+    const keyword = await engine.executeRaw<Record<string, unknown>>(
+      `SELECT p.source_id, p.slug, cc.chunk_text,
+              p.search_vector::text AS page_search_vector,
+              cc.search_vector::text AS chunk_search_vector
+         FROM pages p
+         JOIN content_chunks cc ON cc.page_id=p.id
+        WHERE p.source_id=$1
+          AND p.slug=$2
+          AND cc.search_vector @@ websearch_to_tsquery('english', $3)`,
+      [f.sourceId, f.slug, 'NebulaAnchor42'],
+    );
+    expect(keyword).toHaveLength(1);
+    expect(keyword[0]).toMatchObject({
+      source_id: f.sourceId,
+      slug: f.slug,
+      chunk_text: ocrText,
+    });
+    expect(String(keyword[0].page_search_vector).trim()).not.toBe('');
+    expect(String(keyword[0].chunk_search_vector).trim()).not.toBe('');
+    expect(await engine.getConfig('ocr_provider_attempts')).toBe('17');
+    expect(await engine.getConfig('ocr_successful_provider_receipts')).toBe('13');
+    expect(await engine.getConfig('ocr_persisted_imports')).toBe('11');
+
+    const replay = await adopt(f);
+    expect(replay.status).toBe('idempotent');
+    if (replay.status !== 'idempotent') throw new Error('expected exact replay');
+    const { status: _status, ...replayReceipt } = replay;
+    expect(replayReceipt).toEqual(result.receipt);
+
+    const rolled = await withImageImportFence(
+      token => rollbackImageFileExactHashDonor(engine, replayReceipt, token),
+      { lockRoot: fenceRoot },
+    );
+    expect(rolled.status).toBe('rolled_back');
+    expect(await engine.getPage(f.slug, {
+      sourceId: f.sourceId,
+      includeDeleted: true,
+    })).toBeNull();
+    expect(await fileState(f.slug)).toBeNull();
+  });
+
+  test('keeps the embedded v1 donor-state digest schema compatible with existing receipts', async () => {
+    const f = await fixture('v1-receipt-compatibility');
+    const donor = await seedDonor(f.hash, { slug: 'donors/v1-compatible.png' });
+    const legacyRows = await engine.executeRaw<Record<string, unknown>>(
+      `SELECT
+         p.id AS donor_page_id,
+         cc.id AS donor_chunk_id,
+         p.source_id AS donor_source_id,
+         p.slug AS donor_slug,
+         p.compiled_truth,
+         p.embedding_signature,
+         p.contextual_retrieval_mode,
+         p.corpus_generation,
+         cc.chunk_text,
+         cc.model,
+         cc.token_count,
+         cc.embedded_at,
+         cc.embedding::text AS embedding,
+         vector_dims(cc.embedding)::int AS embedding_dims,
+         CASE WHEN cc.embedding_image IS NULL THEN NULL ELSE cc.embedding_image::text END AS embedding_image,
+         CASE WHEN cc.embedding_multimodal IS NULL THEN NULL ELSE cc.embedding_multimodal::text END AS embedding_multimodal
+       FROM pages p
+       JOIN content_chunks cc ON cc.page_id=p.id
+       WHERE p.id=$1 AND cc.id=$2`,
+      [donor.pageId, donor.chunkId],
+    );
+
+    const result = await adopt(f);
+    expect(result.status).toBe('adopted');
+    if (result.status !== 'adopted') throw new Error('expected embedded v1 adoption');
+    expect(result.receipt.policy_version).toBe(IMAGE_DONOR_ADOPTION_POLICY_VERSION);
+    expect(result.receipt.donor_state_sha256).toBe(stableStateDigest(legacyRows[0]));
+    expect(result.receipt.text_embedding_sha256).toMatch(/^[a-f0-9]{64}$/);
   });
 
   test('chooses the lowest page/chunk IDs deterministically and binds all reusable digests', async () => {
