@@ -1,6 +1,6 @@
-import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, readdirSync, realpathSync } from 'fs';
-import { join, dirname, resolve } from 'path';
-import type { StorageBackend } from '../storage.ts';
+import { writeFileSync, unlinkSync, existsSync, mkdirSync, readdirSync, realpathSync } from 'fs';
+import { join, dirname, isAbsolute, relative, resolve, sep } from 'path';
+import { readLocalFileBounded, type StorageBackend } from '../storage.ts';
 
 /**
  * Local filesystem storage — for testing and development.
@@ -28,10 +28,15 @@ export class LocalStorage implements StorageBackend {
     writeFileSync(full, data);
   }
 
-  async download(path: string): Promise<Buffer> {
+  async download(path: string, maxBytes?: number): Promise<Buffer> {
     const full = this.contained(path);
     if (!existsSync(full)) throw new Error(`File not found in storage: ${path}`);
-    return readFileSync(full);
+    const canonicalFull = realpathSync(full);
+    const rel = relative(this.canonicalBase, canonicalFull);
+    if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+      throw new Error('Path traversal blocked: storage file resolves outside storage root');
+    }
+    return readLocalFileBounded(canonicalFull, maxBytes);
   }
 
   async delete(path: string): Promise<void> {

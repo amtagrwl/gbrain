@@ -1,7 +1,11 @@
-import { readFileSync, existsSync } from 'fs';
-import { join, dirname } from 'path';
+import { readFileSync, existsSync, realpathSync } from 'fs';
+import { join, dirname, isAbsolute, relative, resolve as resolvePath, sep } from 'path';
 import { parse as parseYaml } from './yaml-lite.ts';
-import type { StorageBackend } from './storage.ts';
+import {
+  readLocalFileBounded,
+  StorageReadLimitError,
+  type StorageBackend,
+} from './storage.ts';
 
 /**
  * Universal file reader with fallback chain:
@@ -15,6 +19,27 @@ import type { StorageBackend } from './storage.ts';
 export interface ResolvedFile {
   data: Buffer;
   source: 'local' | 'storage' | 'redirect';
+}
+
+export interface ResolveFileOptions {
+  maxBytes?: number;
+}
+
+const REDIRECT_METADATA_MAX_BYTES = 64 * 1024;
+
+function canonicalPathWithin(root: string, path: string): string {
+  const canonical = realpathSync(path);
+  const rel = relative(root, canonical);
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error('Resolved file escapes the configured source root');
+  }
+  return canonical;
+}
+
+function readRedirectMetadata<T>(path: string, canonicalRoot: string): T {
+  const canonical = canonicalPathWithin(canonicalRoot, path);
+  const content = readLocalFileBounded(canonical, REDIRECT_METADATA_MAX_BYTES).toString('utf-8');
+  return parseYaml(content) as unknown as T;
 }
 
 /** v0.9+ redirect format (.redirect.yaml) — richer metadata */
@@ -51,28 +76,31 @@ export async function resolveFile(
   filePath: string,
   brainRoot: string,
   storage?: StorageBackend,
+  options: ResolveFileOptions = {},
 ): Promise<ResolvedFile> {
   // Validate filePath stays within brainRoot (prevents MCP callers from reading arbitrary files)
-  const { resolve: resolvePath } = await import('path');
   const resolvedRoot = resolvePath(brainRoot);
   const resolvedFull = resolvePath(brainRoot, filePath);
-  if (!resolvedFull.startsWith(resolvedRoot + '/') && resolvedFull !== resolvedRoot) {
+  const lexicalRel = relative(resolvedRoot, resolvedFull);
+  if (lexicalRel === '..' || lexicalRel.startsWith(`..${sep}`) || isAbsolute(lexicalRel)) {
     throw new Error(`Path traversal blocked: ${filePath} resolves outside brain root`);
   }
+  const canonicalRoot = realpathSync(resolvedRoot);
 
   const fullPath = join(brainRoot, filePath);
 
   // 1. Local file exists
   if (existsSync(fullPath)) {
-    return { data: readFileSync(fullPath), source: 'local' };
+    const canonicalFull = canonicalPathWithin(canonicalRoot, fullPath);
+    return { data: readLocalFileBounded(canonicalFull, options.maxBytes), source: 'local' };
   }
 
   // 2. .redirect.yaml pointer (v0.9+ format)
   const yamlRedirectPath = fullPath + '.redirect.yaml';
   if (existsSync(yamlRedirectPath)) {
     if (!storage) throw new Error(`File redirected to storage but no storage backend configured: ${filePath}`);
-    const info = parseRedirectYaml(yamlRedirectPath);
-    const data = await storage.download(info.storage_path);
+    const info = readRedirectMetadata<RedirectYaml>(yamlRedirectPath, canonicalRoot);
+    const data = await storage.download(info.storage_path, options.maxBytes);
     return { data, source: 'redirect' };
   }
 
@@ -80,8 +108,8 @@ export async function resolveFile(
   const legacyRedirectPath = fullPath + '.redirect';
   if (existsSync(legacyRedirectPath)) {
     if (!storage) throw new Error(`File redirected to storage but no storage backend configured: ${filePath}`);
-    const info = parseRedirect(legacyRedirectPath);
-    const data = await storage.download(info.path);
+    const info = readRedirectMetadata<RedirectInfo>(legacyRedirectPath, canonicalRoot);
+    const data = await storage.download(info.path, options.maxBytes);
     return { data, source: 'redirect' };
   }
 
@@ -89,7 +117,7 @@ export async function resolveFile(
   const markerPath = join(dirname(fullPath), '.supabase');
   if (existsSync(markerPath)) {
     if (!storage) throw new Error(`Directory mirrored to storage but no storage backend configured: ${filePath}`);
-    const marker = parseMarker(markerPath);
+    const marker = readRedirectMetadata<MarkerInfo>(markerPath, canonicalRoot);
     // Validate marker.prefix: reject path traversal, absolute paths, bare '..'
     if (marker.prefix) {
       if (/\.\.[\\/]/.test(marker.prefix) || marker.prefix === '..' || marker.prefix.startsWith('/')) {
@@ -102,12 +130,14 @@ export async function resolveFile(
     }
     const storagePath = (marker.prefix || '') + filename;
     try {
-      const data = await storage.download(storagePath);
+      const data = await storage.download(storagePath, options.maxBytes);
       return { data, source: 'storage' };
-    } catch {
+    } catch (error) {
+      if (error instanceof StorageReadLimitError) throw error;
       // Fall back to local if storage fails and local exists
       if (existsSync(fullPath)) {
-        return { data: readFileSync(fullPath), source: 'local' };
+        const canonicalFull = canonicalPathWithin(canonicalRoot, fullPath);
+        return { data: readLocalFileBounded(canonicalFull, options.maxBytes), source: 'local' };
       }
       throw new Error(`File not found locally or in storage: ${filePath}`);
     }

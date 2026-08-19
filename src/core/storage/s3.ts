@@ -6,7 +6,29 @@ import {
   HeadObjectCommand,
   ListObjectsV2Command,
 } from '@aws-sdk/client-s3';
-import type { StorageBackend, StorageConfig } from '../storage.ts';
+import {
+  collectBytesBounded,
+  readResponseBodyBounded,
+  StorageReadLimitError,
+  type StorageBackend,
+  type StorageConfig,
+} from '../storage.ts';
+
+type DownloadBody = AsyncIterable<Uint8Array> & {
+  transformToByteArray(): Promise<Uint8Array>;
+  transformToWebStream?: () => ReadableStream<Uint8Array>;
+  destroy?: () => void;
+  cancel?: () => Promise<void>;
+};
+
+async function cancelDownloadBody(body: DownloadBody): Promise<void> {
+  try {
+    if (typeof body.destroy === 'function') body.destroy();
+    else if (typeof body.cancel === 'function') await body.cancel();
+  } catch {
+    // Best-effort resource cleanup while preserving the typed limit error.
+  }
+}
 
 /**
  * S3-compatible storage — works with AWS S3, Cloudflare R2, MinIO, etc.
@@ -46,13 +68,42 @@ export class S3Storage implements StorageBackend {
     }));
   }
 
-  async download(path: string): Promise<Buffer> {
+  async download(path: string, maxBytes?: number): Promise<Buffer> {
     const res = await this.client.send(new GetObjectCommand({
       Bucket: this.bucket,
       Key: path,
+      ...(maxBytes === undefined ? {} : { Range: `bytes=0-${maxBytes}` }),
     }));
     if (!res.Body) throw new Error(`S3 download returned empty body: ${path}`);
-    return Buffer.from(await res.Body.transformToByteArray());
+    const body = res.Body as unknown as DownloadBody;
+    if (maxBytes !== undefined) {
+      const totalMatch = res.ContentRange?.match(/\/(\d+)$/);
+      const totalSize = totalMatch ? Number(totalMatch[1]) : undefined;
+      if ((totalSize !== undefined && totalSize > maxBytes)
+        || (res.ContentLength !== undefined && res.ContentLength > maxBytes)) {
+        await cancelDownloadBody(body);
+        throw new StorageReadLimitError(maxBytes);
+      }
+    }
+
+    if (typeof body[Symbol.asyncIterator] === 'function') {
+      return collectBytesBounded(body, maxBytes);
+    }
+    if (maxBytes !== undefined) {
+      if (typeof body.transformToWebStream === 'function') {
+        return readResponseBodyBounded(new Response(body.transformToWebStream()), maxBytes);
+      }
+      if (typeof Blob !== 'undefined' && body instanceof Blob) {
+        if (body.size > maxBytes) throw new StorageReadLimitError(maxBytes);
+        const data = Buffer.from(await body.arrayBuffer());
+        if (data.length > maxBytes) throw new StorageReadLimitError(maxBytes);
+        return data;
+      }
+      await cancelDownloadBody(body);
+      throw new StorageReadLimitError(maxBytes);
+    }
+    const data = Buffer.from(await body.transformToByteArray());
+    return data;
   }
 
   async delete(path: string): Promise<void> {

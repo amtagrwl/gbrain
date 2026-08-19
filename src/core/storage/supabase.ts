@@ -1,9 +1,29 @@
-import type { StorageBackend, StorageConfig } from '../storage.ts';
+import {
+  readResponseBodyBounded,
+  StorageReadLimitError,
+  type StorageBackend,
+  type StorageConfig,
+} from '../storage.ts';
 
 /** Size thresholds for upload method selection */
 const TUS_THRESHOLD = 100 * 1024 * 1024;   // 100 MB — use TUS resumable above this
 const TUS_CHUNK_SIZE = 6 * 1024 * 1024;     // 6 MB chunks for TUS uploads
 const SIGNED_URL_EXPIRY = 3600;             // 1 hour
+
+function encodeStorageObjectKey(path: string): string {
+  if (typeof path !== 'string'
+    || path.length === 0
+    || path.length > 4096
+    || path.startsWith('/')
+    || /[\\%?#\u0000-\u001f\u007f]/.test(path)) {
+    throw new Error('Invalid storage object key');
+  }
+  const segments = path.split('/');
+  if (segments.some(segment => segment.length === 0 || segment === '.' || segment === '..')) {
+    throw new Error('Invalid storage object key');
+  }
+  return segments.map(segment => encodeURIComponent(segment)).join('/');
+}
 
 /**
  * Supabase Storage — uses the Supabase Storage REST API.
@@ -28,7 +48,8 @@ export class SupabaseStorage implements StorageBackend {
   }
 
   private url(path: string): string {
-    return `${this.projectUrl}/storage/v1/object/${this.bucket}/${path}`;
+    const root = this.projectUrl.replace(/\/+$/, '');
+    return `${root}/storage/v1/object/${encodeURIComponent(this.bucket)}/${encodeStorageObjectKey(path)}`;
   }
 
   private headers(): Record<string, string> {
@@ -147,12 +168,22 @@ export class SupabaseStorage implements StorageBackend {
     }
   }
 
-  async download(path: string): Promise<Buffer> {
+  async download(path: string, maxBytes?: number): Promise<Buffer> {
     const res = await fetch(this.url(path), {
-      headers: this.headers(),
+      headers: {
+        ...this.headers(),
+        ...(maxBytes === undefined ? {} : { Range: `bytes=0-${maxBytes}` }),
+      },
     });
     if (!res.ok) throw new Error(`Supabase download failed: ${res.status}`);
-    return Buffer.from(await res.arrayBuffer());
+    if (maxBytes !== undefined) {
+      const totalMatch = res.headers.get('content-range')?.match(/\/(\d+)$/);
+      if (totalMatch && Number(totalMatch[1]) > maxBytes) {
+        await res.body?.cancel().catch(() => undefined);
+        throw new StorageReadLimitError(maxBytes);
+      }
+    }
+    return readResponseBodyBounded(res, maxBytes);
   }
 
   async delete(path: string): Promise<void> {

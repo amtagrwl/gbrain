@@ -35,6 +35,7 @@ import { CJK_SLUG_CHARS, PAGE_SLUG_SEG } from './cjk.ts';
 import { ALL_SOURCES } from './source-id.ts';
 import * as db from './db.ts';
 import { VERSION } from '../version.ts';
+import { ArtifactReadError, readArtifact } from './read-artifact.ts';
 import {
   GET_RECENT_SALIENCE_DESCRIPTION,
   FIND_ANOMALIES_DESCRIPTION,
@@ -3352,6 +3353,45 @@ const file_url: Operation = {
   },
 };
 
+const read_artifact: Operation = {
+  name: 'read_artifact',
+  description: 'Read bounded original bytes for an exact image artifact page',
+  params: {
+    source_id: { type: 'string', required: true, description: 'Exact source ID' },
+    page_slug: { type: 'string', required: true, description: 'Exact image page slug' },
+    content_hash: { type: 'string', required: true, description: 'Exact SHA-256 content hash' },
+  },
+  scope: 'read',
+  handler: async (ctx, p) => {
+    const input = {
+      source_id: p.source_id as string,
+      page_slug: p.page_slug as string,
+      content_hash: p.content_hash as string,
+    };
+    if (ctx.remote !== false) {
+      const federated = ctx.auth?.allowedSources;
+      const grantedSources = federated && federated.length > 0
+        ? federated
+        : ctx.sourceId ? [ctx.sourceId] : [];
+      if (!grantedSources.includes(input.source_id)) {
+        throw new OperationError(
+          'permission_denied',
+          'read_artifact is not authorized for the requested source',
+          'Request an artifact from a source in the caller source grant.',
+        );
+      }
+    }
+    try {
+      return await readArtifact(ctx.engine, ctx.config, input);
+    } catch (error) {
+      if (error instanceof ArtifactReadError) {
+        throw new OperationError(error.code, error.message);
+      }
+      throw new OperationError('artifact_unavailable', 'The approved artifact bytes are unavailable');
+    }
+  },
+};
+
 // --- Jobs (Minions) ---
 
 const submit_job: Operation = {
@@ -6385,7 +6425,7 @@ export const operations: Operation[] = [
   // Ingest log
   log_ingest, get_ingest_log,
   // Files
-  file_list, file_upload, file_url,
+  file_list, file_upload, file_url, read_artifact,
   // Jobs (Minions)
   submit_job, get_job, list_jobs, cancel_job, retry_job, get_job_progress,
   pause_job, resume_job, replay_job, send_job_message,

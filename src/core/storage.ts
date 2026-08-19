@@ -5,9 +5,103 @@
  * the backend (Supabase Storage or S3/R2/MinIO), gbrain doesn't care.
  */
 
+import { closeSync, fstatSync, openSync, readFileSync, readSync } from 'node:fs';
+
+export class StorageReadLimitError extends Error {
+  constructor(public readonly limitBytes: number) {
+    super(`Storage object exceeds read limit of ${limitBytes} bytes`);
+    this.name = 'StorageReadLimitError';
+  }
+}
+
+function validateReadLimit(maxBytes: number): void {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+    throw new Error('Storage read limit must be a non-negative safe integer');
+  }
+}
+
+/** Read a local file while refusing content beyond maxBytes (plus one probe byte). */
+export function readLocalFileBounded(path: string, maxBytes?: number): Buffer {
+  if (maxBytes === undefined) return readFileSync(path);
+  validateReadLimit(maxBytes);
+
+  const fd = openSync(path, 'r');
+  try {
+    if (fstatSync(fd).size > maxBytes) throw new StorageReadLimitError(maxBytes);
+    const chunks: Buffer[] = [];
+    let total = 0;
+    while (true) {
+      const probeRemaining = maxBytes + 1 - total;
+      if (probeRemaining <= 0) throw new StorageReadLimitError(maxBytes);
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, probeRemaining));
+      const count = readSync(fd, chunk, 0, chunk.length, null);
+      if (count === 0) break;
+      total += count;
+      if (total > maxBytes) throw new StorageReadLimitError(maxBytes);
+      chunks.push(chunk.subarray(0, count));
+    }
+    return Buffer.concat(chunks, total);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Collect an SDK byte stream while refusing payload beyond the byte cap. */
+export async function collectBytesBounded(
+  stream: AsyncIterable<Uint8Array>,
+  maxBytes?: number,
+): Promise<Buffer> {
+  if (maxBytes !== undefined) validateReadLimit(maxBytes);
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const value of stream) {
+    const chunk = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+    total += chunk.length;
+    if (maxBytes !== undefined && total > maxBytes) {
+      throw new StorageReadLimitError(maxBytes);
+    }
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, total);
+}
+
+/** Consume a fetch response body with a hard payload cap, even if Range is ignored. */
+export async function readResponseBodyBounded(
+  response: Response,
+  maxBytes?: number,
+): Promise<Buffer> {
+  if (maxBytes === undefined) return Buffer.from(await response.arrayBuffer());
+  validateReadLimit(maxBytes);
+  const declaredLength = Number(response.headers.get('content-length'));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new StorageReadLimitError(maxBytes);
+  }
+  if (!response.body) return Buffer.alloc(0);
+
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new StorageReadLimitError(maxBytes);
+      }
+      chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, total);
+}
+
 export interface StorageBackend {
   upload(path: string, data: Buffer, mime?: string): Promise<void>;
-  download(path: string): Promise<Buffer>;
+  download(path: string, maxBytes?: number): Promise<Buffer>;
   delete(path: string): Promise<void>;
   exists(path: string): Promise<boolean>;
   list(prefix: string): Promise<string[]>;
