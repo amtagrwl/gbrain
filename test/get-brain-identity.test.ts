@@ -72,6 +72,7 @@ describe('get_brain_identity op', () => {
     };
 
     expect(result.version).toBe(VERSION);
+    expect(result.version).toBe('0.44.0.1');
     expect(result.engine).toBe('pglite');
     expect(result.page_count).toBe(0);
     expect(result.chunk_count).toBe(0);

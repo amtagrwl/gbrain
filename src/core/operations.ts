@@ -3355,18 +3355,20 @@ const file_url: Operation = {
 
 const read_artifact: Operation = {
   name: 'read_artifact',
-  description: 'Read bounded original bytes for an exact image artifact page',
+  description: 'Read bounded original bytes for an exact image artifact and its canonical parent page',
   params: {
-    source_id: { type: 'string', required: true, description: 'Exact source ID' },
-    page_slug: { type: 'string', required: true, description: 'Exact image page slug' },
-    content_hash: { type: 'string', required: true, description: 'Exact SHA-256 content hash' },
+    source_id: { type: 'string', required: true, description: 'Exact requested source ID' },
+    page_slug: { type: 'string', required: true, description: 'Exact image child page slug' },
+    parent_page_slug: { type: 'string', required: true, description: 'Exact canonical parent email page slug' },
+    content_hash: { type: 'string', description: 'Optional exact SHA-256 content hash from search' },
   },
   scope: 'read',
   handler: async (ctx, p) => {
     const input = {
       source_id: p.source_id as string,
       page_slug: p.page_slug as string,
-      content_hash: p.content_hash as string,
+      parent_page_slug: p.parent_page_slug as string,
+      ...(typeof p.content_hash === 'string' ? { content_hash: p.content_hash } : {}),
     };
     if (ctx.remote !== false) {
       const federated = ctx.auth?.allowedSources;

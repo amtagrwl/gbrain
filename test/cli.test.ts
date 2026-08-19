@@ -137,6 +137,17 @@ describe('BigInt-safe output normalization (#2450)', () => {
 });
 
 describe('CLI version', () => {
+  test('carries the custom Tark image-read patch identity in VERSION and package metadata', async () => {
+    const { VERSION } = await import('../src/version.ts');
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8'));
+    const versionFile = readFileSync(new URL('../VERSION', import.meta.url), 'utf-8').trim();
+    expect({ runtime: VERSION, package: pkg.version, file: versionFile }).toEqual({
+      runtime: '0.44.0.1',
+      package: '0.44.0.1',
+      file: '0.44.0.1',
+    });
+  });
+
   test('VERSION matches package.json', async () => {
     const { VERSION } = await import('../src/version.ts');
     const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8'));

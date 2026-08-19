@@ -22,7 +22,7 @@ export type ArtifactReadErrorCode =
   | 'artifact_unavailable';
 
 const ERROR_MESSAGES: Record<ArtifactReadErrorCode, string> = {
-  invalid_params: 'read_artifact requires a valid exact source, page slug, and SHA-256 hash',
+  invalid_params: 'read_artifact requires a valid exact source, child page slug, and canonical parent page slug',
   artifact_not_found: 'No approved artifact exists at the requested source and page coordinate',
   artifact_mismatch: 'The approved page and file records do not identify the same image artifact',
   artifact_stale: 'The requested artifact hash or stored metadata is stale',
@@ -41,7 +41,8 @@ export class ArtifactReadError extends Error {
 export interface ReadArtifactInput {
   source_id: string;
   page_slug: string;
-  content_hash: string;
+  parent_page_slug: string;
+  content_hash?: string;
 }
 
 export interface ReadArtifactResult {
@@ -63,23 +64,38 @@ function isValidArtifactSlug(value: unknown): value is string {
 function validateInput(input: ReadArtifactInput): void {
   if (!isValidSourceId(input.source_id)
     || !isValidArtifactSlug(input.page_slug)
-    || !/^[a-f0-9]{64}$/.test(input.content_hash)) {
+    || !isValidArtifactSlug(input.parent_page_slug)
+    || (input.content_hash !== undefined && !/^[a-f0-9]{64}$/.test(input.content_hash))) {
     throw new ArtifactReadError('invalid_params');
   }
 }
 
-function selectApprovedFile(files: FileRow[], input: ReadArtifactInput): FileRow {
-  const coordinateMatches = files.filter(file =>
-    file.source_id === input.source_id
-    && file.page_slug === input.page_slug
-  );
-  if (coordinateMatches.length === 0) {
-    throw new ArtifactReadError(files.length === 0 ? 'artifact_not_found' : 'artifact_mismatch');
+/**
+ * Imported email images use one stable relationship: `root/filename` is a
+ * direct child of the canonical email page `root/root`. The caller must carry
+ * that exact parent coordinate from search; runtime never guesses from report
+ * ids, subjects, or answer text.
+ */
+function verifyDirectCanonicalParent(pageSlug: string, parentPageSlug: string): void {
+  const child = pageSlug.split('/');
+  if (child.length !== 2) throw new ArtifactReadError('artifact_mismatch');
+  const [root, filename] = child;
+  if (!root || !filename || root === filename || parentPageSlug !== `${root}/${root}`) {
+    throw new ArtifactReadError('artifact_mismatch');
   }
-  const hashMatches = coordinateMatches.filter(file => file.content_hash === input.content_hash);
-  if (hashMatches.length === 0) throw new ArtifactReadError('artifact_stale');
-  if (hashMatches.length !== 1) throw new ArtifactReadError('artifact_mismatch');
-  return hashMatches[0];
+}
+
+function selectApprovedFile(files: FileRow[], pageId: number, pageSlug: string, ownerSourceId: string): FileRow {
+  if (files.length === 0) throw new ArtifactReadError('artifact_not_found');
+  if (files.length !== 1) throw new ArtifactReadError('artifact_mismatch');
+  const file = files[0];
+  if (file.page_id === null
+    || String(file.page_id) !== String(pageId)
+    || file.page_slug !== pageSlug
+    || file.source_id !== ownerSourceId) {
+    throw new ArtifactReadError('artifact_mismatch');
+  }
+  return file;
 }
 
 function sniffImageMime(data: Buffer): string | null {
@@ -124,19 +140,59 @@ export async function readArtifact(
   input: ReadArtifactInput,
 ): Promise<ReadArtifactResult> {
   validateInput(input);
+  verifyDirectCanonicalParent(input.page_slug, input.parent_page_slug);
 
-  const page = await engine.getPage(input.page_slug, { sourceId: input.source_id });
+  const source = (await engine.listAllSources({ includeArchived: false }))
+    .find(candidate => candidate.id === input.source_id);
+  if (!source) throw new ArtifactReadError('artifact_not_found');
+
+  // Parent proof is always evaluated in the requested source. A same-slug row
+  // in `default` (or any other source) cannot authorize an artifact read.
+  const parent = await engine.getPage(input.parent_page_slug, { sourceId: input.source_id });
+  if (!parent) throw new ArtifactReadError('artifact_not_found');
+  if (parent.source_id !== input.source_id || parent.slug !== input.parent_page_slug) {
+    throw new ArtifactReadError('artifact_mismatch');
+  }
+  const parentMessageId = parent.frontmatter?.message_id;
+  if (parent.type === 'image'
+    || typeof parentMessageId !== 'string'
+    || !/^<[^<>\s@]+@[^<>\s@]+>$/.test(parentMessageId)) {
+    throw new ArtifactReadError('artifact_mismatch');
+  }
+
+  let page = await engine.getPage(input.page_slug, { sourceId: input.source_id });
+  if (!page && input.source_id !== 'default') {
+    page = await engine.getPage(input.page_slug, { sourceId: 'default' });
+  }
   if (!page) throw new ArtifactReadError('artifact_not_found');
-  if (page.source_id !== input.source_id || page.slug !== input.page_slug) {
+  if (page.slug !== input.page_slug
+    || (page.source_id !== input.source_id && page.source_id !== 'default')) {
     throw new ArtifactReadError('artifact_mismatch');
   }
   if (page.type !== 'image') throw new ArtifactReadError('unsupported_media_type');
-  if (page.content_hash !== input.content_hash) {
+  if (typeof page.content_hash !== 'string' || !/^[a-f0-9]{64}$/.test(page.content_hash)) {
+    throw new ArtifactReadError('artifact_stale');
+  }
+  if (input.content_hash !== undefined && page.content_hash !== input.content_hash) {
     throw new ArtifactReadError('artifact_stale');
   }
 
-  const file = selectApprovedFile(await engine.listFilesForPage(page.id), input);
-  if (file.page_id !== page.id) throw new ArtifactReadError('artifact_mismatch');
+  const file = selectApprovedFile(
+    await engine.listFilesForPage(page.id),
+    page.id,
+    input.page_slug,
+    page.source_id,
+  );
+  if (file.content_hash !== page.content_hash) throw new ArtifactReadError('artifact_stale');
+
+  // Correctly owned rows agree on the requested source. Legacy imported image
+  // rows may agree on `default`, but only after the exact requested-source
+  // parent proof above. No mixed ownership and no third source are admitted.
+  const correctlyOwned = page.source_id === input.source_id && file.source_id === input.source_id;
+  const legacyOwned = input.source_id !== 'default'
+    && page.source_id === 'default'
+    && file.source_id === 'default';
+  if (!correctlyOwned && !legacyOwned) throw new ArtifactReadError('artifact_mismatch');
 
   const mimeType = file.mime_type;
   if (mimeType !== 'image/png' && mimeType !== 'image/jpeg' && mimeType !== 'image/webp') {
@@ -150,10 +206,6 @@ export async function readArtifact(
     throw new ArtifactReadError('artifact_too_large');
   }
 
-  const source = (await engine.listAllSources({ includeArchived: false }))
-    .find(candidate => candidate.id === input.source_id);
-  if (!source) throw new ArtifactReadError('artifact_not_found');
-
   let storage: StorageBackend | undefined;
   try {
     storage = config.storage
@@ -162,12 +214,17 @@ export async function readArtifact(
   } catch {
     throw new ArtifactReadError('artifact_unavailable');
   }
+
+  // Deliberately resolve legacy metadata through the requested source's root or
+  // configured storage. The `default` ownership marker never widens filesystem
+  // scope and is not used to select physical storage.
   const data = await resolveArtifactBytes(file, source.local_path, storage);
   if (data.length !== sizeBytes) throw new ArtifactReadError('artifact_stale');
   if (sniffImageMime(data) !== mimeType) throw new ArtifactReadError('artifact_mismatch');
 
   const actualHash = createHash('sha256').update(data).digest('hex');
-  if (actualHash !== input.content_hash || actualHash !== file.content_hash) {
+  if (actualHash !== page.content_hash || actualHash !== file.content_hash
+    || (input.content_hash !== undefined && actualHash !== input.content_hash)) {
     throw new ArtifactReadError('artifact_stale');
   }
 

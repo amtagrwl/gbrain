@@ -2,6 +2,14 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.44.0.1] - 2026-08-20
+
+### Fixed
+
+- Added a fail-closed `read_artifact` bridge for legacy image child rows jointly owned by `default`, requiring exact canonical parent proof in the requested source and resolving bytes only through that source's storage boundary.
+- Made artifact `content_hash` pinning optional while retaining stored metadata, actual-byte SHA-256, MIME signature, size, ownership, path, and 5 MiB validations.
+- Added the exact canonical parent coordinate to the artifact read contract for downstream opaque-grant integrations.
+
 ## [0.44.0.0] - 2026-06-12
 
 **BrainBench: agent memory now has a scorecard.** `gbrain eval brainbench` is a public, reproducible, cross-harness conformance suite for the four ways agent memory fails — and from this release forward, every memory PR must hold or move its numbers against a committed baseline that CI compares against master's own copy.
